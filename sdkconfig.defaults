@@ -1,0 +1,80 @@
+# sdkconfig.defaults — M4NT1S
+#
+# sdkconfig.defaults is only read when sdkconfig does not exist.
+# To apply changes: delete sdkconfig, then
+#     idf.py fullclean
+#     idf.py build
+# Do not edit sdkconfig directly.
+
+# ---------------------------------------------------------------------------
+# Target and flash
+# ---------------------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------------------------------------------------------------------------
+# Stack and heap sizing
+#
+# 32 KB main task stack was the single largest unnecessary contiguous
+# block at boot. 8 KB is plenty for the menu state machine.
+# LVGL pool dropped from 64 KB default to 24 KB — adequate for a
+# five-screen text UI.
+# ---------------------------------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_LV_MEM_SIZE=24576
+
+# ---------------------------------------------------------------------------
+# Fonts — ui.c uses 14 for the menu, 28 for the backdrop label
+# ---------------------------------------------------------------------------
+CONFIG_LV_FONT_MONTSERRAT_10=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_UNSCII_8=y
+
+# ---------------------------------------------------------------------------
+# Wi-Fi
+#
+# Sniffer does not need 10 static RX buffers. Four is enough for
+# management-frame capture and frees the rest for the general DMA pool.
+# AMPDU disabled to fix SoftAP client disconnects.
+# ---------------------------------------------------------------------------
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# ---------------------------------------------------------------------------
+# Bluetooth / NimBLE
+#
+# NimBLE only. Bluedroid must be OFF — it was enabled in the previous
+# defaults file, which contradicts CONFIG_BT_NIMBLE_ENABLED and wastes
+# nothing but also does not work correctly (both stacks cannot run).
+#
+# The CONFIG_BT_BLE_42_* entries that used to live here are Bluedroid
+# settings and have no effect under NimBLE. Removed.
+# ---------------------------------------------------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=n
+
+# ---------------------------------------------------------------------------
+# Console
+# ---------------------------------------------------------------------------
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ---------------------------------------------------------------------------
+# Watchdog
+# ---------------------------------------------------------------------------
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
+
+# HID
+CONFIG_TINYUSB_HID_COUNT=1
+CONFIG_TINYUSB_DMA_DISABLE=y
