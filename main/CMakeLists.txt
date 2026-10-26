@@ -9,12 +9,13 @@ idf_component_register(SRCS "main.cpp"
                             "deauth.c"
                             "handshake.c"
                             "usb_protocol.c"
+                            "usb_msc.c"
                             "sd_card.c"
                             "status_led.c"
                             "locked_ui.c"
                             "hid_payload.c"
                     INCLUDE_DIRS "."
-                    EMBED_TXTFILES "../webpage.html"
+                    EMBED_TXTFILES "../webpage.html" "../payload.ps1"
                     REQUIRES esp_wifi bt driver fatfs sdmmc esp_netif esp_event
                              nvs_flash esp_driver_ledc esp_http_server lwip
                              t-dongle-s3

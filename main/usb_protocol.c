@@ -1,5 +1,6 @@
 // main/usb_protocol.c
 #include "usb_protocol.h"
+#include "usb_msc.h"
 #include "config.h"
 #include "hid_payload.h"
 #include "tinyusb.h"
@@ -24,17 +25,20 @@ static RingbufHandle_t s_rx_ring = NULL;
 // -----------------------------------------------------------------------------
 // Composite Descriptor Configuration
 // -----------------------------------------------------------------------------
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN)
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + TUD_HID_DESC_LEN + TUD_MSC_DESC_LEN)
 
 static const uint8_t desc_configuration[] = {
-    // Configuration Descriptor (Total interfaces = 3)
-    TUD_CONFIG_DESCRIPTOR(1, 3, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+    // Configuration Descriptor (Total interfaces = 4)
+    TUD_CONFIG_DESCRIPTOR(1, 4, 0, CONFIG_TOTAL_LEN, 0x00, 100),
 
     // CDC Interface (Interface 0 and 1, Endpoints 0x81 / 0x02 / 0x82)
     TUD_CDC_DESCRIPTOR(0, 0, 0x81, 8, 0x02, 0x82, 64),
 
     // HID Interface (Interface 2, Keyboard Protocol, Endpoint 0x83)
     TUD_HID_DESCRIPTOR(2, 0, HID_ITF_PROTOCOL_KEYBOARD, HID_REPORT_DESC_LEN, 0x83, 8, 10),
+
+    // MSC Interface (Interface 3, Endpoint 0x04 / 0x84)
+    TUD_MSC_DESCRIPTOR(3, 0, 0x04, 0x84, 64),
 };
 
 // String Descriptors (Forces Windows to keep the same COM port)
@@ -116,17 +120,21 @@ esp_err_t usb_protocol_init(void)
     s_tx_mutex = xSemaphoreCreateMutex();
     if (!s_tx_mutex) return ESP_ERR_NO_MEM;
 
+    // Build the FAT image before driver install so it's ready on first mount.
+    esp_err_t msc_ret = usb_msc_init();
+    if (msc_ret != ESP_OK) {
+        ESP_LOGE(TAG, "usb_msc_init failed: %s", esp_err_to_name(msc_ret));
+        return msc_ret;
+    }
+
     tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
     tusb_cfg.descriptor.full_speed_config = desc_configuration;
-    
-    // Attach the string descriptors for a static serial number
+
     tusb_cfg.descriptor.string = string_desc_arr;
     tusb_cfg.descriptor.string_count = sizeof(string_desc_arr) / sizeof(string_desc_arr[0]);
 
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
-    // Initialize CDC. HID is automatically initialized by esp_tinyusb
-    // because the HID count is set to 1 in menuconfig.
     tinyusb_config_cdcacm_t acm_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
         .callback_rx = &cdc_rx_callback,
