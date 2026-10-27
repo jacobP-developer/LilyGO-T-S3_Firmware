@@ -38,20 +38,17 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     (void)buffer; (void)bufsize;
 }
 
-// Longer host timeout. 5 seconds is enough to survive Defender scan
-// stalls, power management blips, and busy USB hubs. The original 1s
-// caused silent truncation at ~550 chars on a loaded host.
+// 1s cap. If USB is unmounted we bail immediately rather than waiting the
+// full window, so a mid-payload disconnect cannot wedge the task for
+// minutes (previous 5s * 3 retries per failed char = ~15s/char).
 static bool wait_ready(void) {
-    int timeout = 1000;  // 1000 * 5ms = 5s
-    while (!tud_hid_ready() && timeout > 0) {
+    for (int i = 0; i < 200; i++) {  // 200 * 5ms = 1s
+        if (!tud_mounted()) return false;
+        if (tud_hid_ready()) return true;
         vTaskDelay(pdMS_TO_TICKS(5));
-        timeout--;
     }
-    if (timeout == 0) {
-        ESP_LOGE(TAG, "HID timeout: host not ready after 5s");
-        return false;
-    }
-    return true;
+    ESP_LOGE(TAG, "HID timeout: host not ready after 1s");
+    return false;
 }
 
 static bool send_report(uint8_t modifier, const uint8_t keys[6]) {
@@ -72,14 +69,24 @@ static void release_keys_slow(void) {
     vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-// Retries a single character up to 3 times. Slower hold (30ms) and
-// release (15ms) than before, which materially reduces transient drops
-// on busy hosts. The cost is ~45ms/char instead of ~30ms, i.e. a 400
-// char payload types in ~18s instead of ~12s. Worth it for reliability.
+// Keycode mapping. Shared between US and UK except for six characters
+// where the physical key positions differ:
+//
+//   char   US                UK
+//   "      Shift+0x34        Shift+0x1F
+//   @      Shift+0x1F        Shift+0x34
+//   #      Shift+0x20        0x31
+//   ~      Shift+0x35        Shift+0x31
+//   \      0x31              0x64
+//   |      Shift+0x31        Shift+0x64
+//
+// s_layout is read here — previously it was written by set_layout() and
+// never consulted, so HID_LAYOUT_US silently produced UK output.
 static bool type_char(char c) {
     uint8_t modifier = 0;
     uint8_t key = 0;
 
+    // Identical on US and UK
     if (c >= 'a' && c <= 'z') { key = 0x04 + (c - 'a'); }
     else if (c >= 'A' && c <= 'Z') { key = 0x04 + (c - 'A'); modifier = 0x02; }
     else if (c >= '1' && c <= '9') { key = 0x1E + (c - '1'); }
@@ -111,16 +118,45 @@ static bool type_char(char c) {
     else if (c == '<') { key = 0x36; modifier = 0x02; }
     else if (c == '>') { key = 0x37; modifier = 0x02; }
     else if (c == '?') { key = 0x38; modifier = 0x02; }
-    else if (c == '\\') { key = 0x64; }
-    else if (c == '|') { key = 0x64; modifier = 0x02; }
-    else if (c == '@') { key = 0x34; modifier = 0x02; }
-    else if (c == '"') { key = 0x1F; modifier = 0x02; }
-    else if (c == '#') { key = 0x31; }
-    else if (c == '~') { key = 0x31; modifier = 0x02; }
+    // Layout-dependent
+    else if (c == '@') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x34; modifier = 0x02; }
+        else                           { key = 0x1F; modifier = 0x02; }
+    }
+    else if (c == '"') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x1F; modifier = 0x02; }
+        else                           { key = 0x34; modifier = 0x02; }
+    }
+    else if (c == '#') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x31; }
+        else                           { key = 0x20; modifier = 0x02; }
+    }
+    else if (c == '~') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x31; modifier = 0x02; }
+        else                           { key = 0x35; modifier = 0x02; }
+    }
+    else if (c == '\\') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x64; }
+        else                           { key = 0x31; }
+    }
+    else if (c == '|') {
+        if (s_layout == HID_LAYOUT_UK) { key = 0x64; modifier = 0x02; }
+        else                           { key = 0x31; modifier = 0x02; }
+    }
+    else {
+        // Unknown byte: log so it's visible in the console instead of
+        // vanishing silently.
+        ESP_LOGW(TAG, "unsupported char 0x%02x ('%c')", (uint8_t)c, c);
+        return true;
+    }
 
     if (key == 0) return true;
 
     for (int attempt = 0; attempt < 3; attempt++) {
+        if (!tud_mounted()) {
+            ESP_LOGE(TAG, "USB dismounted mid-string");
+            return false;
+        }
         uint8_t keys[6] = { key, 0, 0, 0, 0, 0 };
         if (send_report(modifier, keys)) {
             vTaskDelay(pdMS_TO_TICKS(30));
@@ -141,6 +177,10 @@ void hid_payload_set_layout(hid_layout_t layout) { s_layout = layout; }
 
 void hid_payload_send_string(const char *str) {
     if (!s_enabled || !str) return;
+    if (!tud_mounted()) {
+        ESP_LOGE(TAG, "USB not mounted, aborting string");
+        return;
+    }
     size_t len = strlen(str);
     for (size_t i = 0; i < len; i++) {
         if (!type_char(str[i])) {

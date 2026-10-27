@@ -1,4 +1,3 @@
 build/ 
 managed_components/ 
-c2.db
-slave_ids.json
+C2/C2

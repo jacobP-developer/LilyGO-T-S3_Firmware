@@ -134,6 +134,20 @@ if ($Mode -eq "install" -or $Mode -eq "auto") {
     $createOut = schtasks /create /tn "$AgentTask" /tr "$psExe -Mode agent" /sc onstart /ru SYSTEM /rl highest /f 2>&1
     Log "[*] schtasks create: $createOut"
 
+    # ---- CLEAR AC-POWER CONDITIONS ----
+    # schtasks /create /sc onstart silently sets "no start on batteries",
+    # which leaves the task Queued forever on a laptop that isn't on AC.
+    # Clear both conditions right after creation so the task runs reliably.
+    try {
+        $t = Get-ScheduledTask -TaskPath "\Microsoft\Windows\Device Setup\" -TaskName "Device Metadata Refresh" -ErrorAction Stop
+        $t.Settings.DisallowStartIfOnBatteries = $false
+        $t.Settings.StopIfGoingOnBatteries     = $false
+        Set-ScheduledTask -TaskPath "\Microsoft\Windows\Device Setup\" -TaskName "Device Metadata Refresh" -Settings $t.Settings | Out-Null
+        Log "[+] Battery conditions cleared on task"
+    } catch {
+        Log "[!] Failed to clear battery conditions: $($_.Exception.Message)"
+    }
+
     "installed $(Get-Date -Format o)" | Out-File $LockFile
 
     $runOut = schtasks /run /tn "$AgentTask" 2>&1
