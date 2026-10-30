@@ -1,7 +1,8 @@
 # sdkconfig.defaults — M4NT1S
 #
 # sdkconfig.defaults is only read when sdkconfig does not exist.
-# To apply changes: delete sdkconfig, then
+# To apply changes:
+#     rm sdkconfig  (or: del sdkconfig on Windows)
 #     idf.py fullclean
 #     idf.py build
 # Do not edit sdkconfig directly.
@@ -16,11 +17,6 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ---------------------------------------------------------------------------
 # Stack and heap sizing
-#
-# 32 KB main task stack was the single largest unnecessary contiguous
-# block at boot. 8 KB is plenty for the menu state machine.
-# LVGL pool dropped from 64 KB default to 24 KB — adequate for a
-# five-screen text UI.
 # ---------------------------------------------------------------------------
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_LV_MEM_SIZE=24576
@@ -35,10 +31,6 @@ CONFIG_LV_FONT_UNSCII_8=y
 
 # ---------------------------------------------------------------------------
 # Wi-Fi
-#
-# Sniffer does not need 10 static RX buffers. Four is enough for
-# management-frame capture and frees the rest for the general DMA pool.
-# AMPDU disabled to fix SoftAP client disconnects.
 # ---------------------------------------------------------------------------
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
@@ -46,38 +38,81 @@ CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=n
 CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
 
 # ---------------------------------------------------------------------------
-# Bluetooth / NimBLE
+# Bluetooth / NimBLE — BROADCASTER-ONLY TRIM
 #
-# NimBLE only. Bluedroid must be OFF — it was enabled in the previous
-# defaults file, which contradicts CONFIG_BT_NIMBLE_ENABLED and wastes
-# nothing but also does not work correctly (both stacks cannot run).
+# This firmware only ever advertises. It never accepts connections,
+# never scans, never pairs, never bonds. Every role and buffer that
+# supports those capabilities is disabled here so that the NimBLE
+# footprint fits in the single contiguous DMA block that survives a
+# Wi-Fi teardown on the no-PSRAM S3.
 #
-# The CONFIG_BT_BLE_42_* entries that used to live here are Bluedroid
-# settings and have no effect under NimBLE. Removed.
+# If you later add a connectable feature (e.g. a real peripheral
+# payload that requires pairing), re-enable:
+#     CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+#     CONFIG_BT_NIMBLE_SM_SC=y
+# and expect to raise BLE_MIN_CONTIGUOUS_BYTES in ble_spam.c.
 # ---------------------------------------------------------------------------
 CONFIG_BT_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
+
+# Roles — broadcaster only. Peripheral disabled, central/observer off.
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# Core pinning
 CONFIG_BT_NIMBLE_PINNED_TO_CORE_1=y
 CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=n
 
+# Host state — minimal. No connections, no bonds, no CCCDs needed for
+# advertising-only operation, but leave the structures non-zero because
+# a couple of NimBLE initialisation paths still touch them.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=1
+CONFIG_BT_NIMBLE_MAX_CCCDS=2
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=64
+CONFIG_BT_NIMBLE_L2CAP_COC_MAX_NUM=0
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=1
+
+# Security Manager — off. No pairing, no bonding, no SM protocol.
+CONFIG_BT_NIMBLE_SM_LEGACY=n
+CONFIG_BT_NIMBLE_SM_SC=n
+
+# HCI transport mbuf pools. Broadcaster sends one short payload every
+# ~40 ms; 6 in each direction plus 5 events is generous.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=6
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_TO_LL_COUNT=6
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=5
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=5
+
+# Controller — THIS IS THE BIG ONE.
+# Default BLE_MAX_ACT is 10, which allocates ten independent controller
+# contexts (connection state, scheduling slots, ACL buffers, encryption
+# state). The spam loop only ever has one advertising set open at a
+# time (ble_gap_adv_stop() precedes every ble_gap_adv_start()), so 1
+# is correct and reclaims roughly 15 KB contiguous.
+CONFIG_BT_CTRL_BLE_MAX_ACT=1
+CONFIG_BT_CTRL_BLE_STATIC_ACL_TX_BUF_NB=2
+
+# HCI efficiency mode — smaller transport headers, fewer intermediate
+# buffers between host and controller.
+CONFIG_BT_CTRL_MODE_EFF=y
+CONFIG_BT_CTRL_HCI_TL_EFF=y
+
+# Wi-Fi / BLE coexistence — safe to disable because this firmware
+# refuses to start Wi-Fi after NimBLE is resident (see main.cpp
+# ensure_wifi_ready_for_mode). Once Wi-Fi is torn down, only BLE is
+# active for the rest of the boot, so the coexistence scheduler never
+# has anything to arbitrate. Removes ~4 KB.
+#
+# If the linker complains about a missing coexistence symbol (unlikely
+# in IDF 5.5), remove this single line and rebuild.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
 # ---------------------------------------------------------------------------
 # Console — UART0 (physical pins), NOT USB-Serial-JTAG
-#
-# UART0 is required on this build. USB-Serial-JTAG shares the physical
-# USB port with USB-OTG (TinyUSB). If USJ console is enabled, it fights
-# TinyUSB for the port and breaks the composite device enumeration.
-# UART0 is on GPIO43/44 (pin header on the T-Dongle-S3) and coexists
-# cleanly with the composite USB device.
-#
-# The Kconfig "console backend" is a choice — setting UART_DEFAULT=y
-# implicitly disables the others. The explicit "is not set" lines below
-# make that unambiguous when migrating from the previous defaults file
-# that had USB_SERIAL_JTAG=y.
 # ---------------------------------------------------------------------------
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 # CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG is not set
@@ -98,19 +133,9 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=15
 # ---------------------------------------------------------------------------
 # TinyUSB — composite device: CDC (serial) + HID (keyboard) + MSC (read-only)
 # ---------------------------------------------------------------------------
-
-# ---- DMA ----
-# Keeps the MSC and HID controllers off the DMA path, reducing pressure
-# on the small internal heap during composite bring-up.
 CONFIG_TINYUSB_DMA_DISABLE=y
 
 # ---- VID / PID ----
-# CRITICAL: these must be present in sdkconfig.defaults.
-# If they are lost (e.g. by deleting sdkconfig without them here), the
-# regenerated config uses Espressif's default VID/PID (0x303A:xxxx), and
-# every Windows host treats the dongle as a brand-new device — new COM
-# port, new driver install, broken static COM assignment. The custom
-# VID/PID is what makes "M4NT1S-0001" stay a fixed COM port.
 CONFIG_TINYUSB_DESC_CUSTOM_VID=0x4A15
 CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4201
 # CONFIG_TINYUSB_DESC_USE_ESPRESSIF_VID is not set
@@ -118,19 +143,11 @@ CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4201
 CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0100
 
 # ---- Descriptor strings (fallback only) ----
-# These are only used if usb_protocol.c does NOT supply its own
-# string_desc_arr[] — which it does. Kept here so the Kconfig view
-# matches reality and so a future refactor that removes the override
-# still produces sane strings. The actual enumeration strings come from
-# usb_protocol.c: "M4NT1S" / "T-Dongle S3 Lab" / "M4NT1S-0001".
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="M4NT1S"
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="T-Dongle S3 Lab"
 CONFIG_TINYUSB_DESC_CDC_STRING="M4NT1S CDC"
 
 # ---- CDC ----
-# Required by usb_protocol.c's tinyusb_cdcacm_init() call. These are
-# the internal FIFO sizes used by esp_tinyusb, not the USB endpoint
-# sizes (which are set by TUD_CDC_DESCRIPTOR in usb_protocol.c to 64).
 CONFIG_TINYUSB_CDC_ENABLED=y
 CONFIG_TINYUSB_CDC_COUNT=1
 CONFIG_TINYUSB_CDC_RX_BUFSIZE=512
@@ -138,14 +155,8 @@ CONFIG_TINYUSB_CDC_TX_BUFSIZE=512
 CONFIG_TINYUSB_CDC_EP_BUFSIZE=512
 
 # ---- HID ----
-# HID_COUNT=1 → single HID keyboard for BadUSB payload delivery.
 CONFIG_TINYUSB_HID_COUNT=1
 
 # ---- MSC ----
-# MSC_ENABLED → exposes the "M4NT1S" mass-storage volume containing
-#   payload.ps1, so the HID payload can execute it via a short cradle
-#   one-liner instead of typing thousands of characters.
-# MSC_BUFSIZE=512 → one sector per transfer, matches the FAT12 sector
-#   size in usb_msc.c, enough throughput for the 32 KB read-only volume.
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=512

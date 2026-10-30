@@ -14,15 +14,16 @@
 
 static const char *TAG = "ble_spam";
 
-// NimBLE bring-up needs this much contiguous DMA-capable internal RAM.
-// The number is empirical for these sdkconfig values; if you tighten
-// the NimBLE buffer counts further you can lower it, if you loosen
-// them you must raise it. A failed bring-up at this size is what
-// produces "BLE ERR 257" (ESP_ERR_NO_MEM).
-#define BLE_MIN_CONTIGUOUS_BYTES  (50 * 1024)
+// NimBLE broadcaster + default buffer counts need roughly this much
+// contiguous DMA-capable internal RAM. 32 KB is realistic for the S3
+// no-PSRAM configuration with the current sdkconfig. If you ever loosen
+// the NimBLE buffer counts in menuconfig you can lower this; if you
+// tighten them raise it. A precheck failure here is what produces the
+// user-visible "BLE ERR 257" after Wi-Fi has run in the same boot.
+#define BLE_MIN_CONTIGUOUS_BYTES  (32 * 1024)
 
 // ---------------------------------------------------------------------------
-// Payloads (unchanged)
+// Payloads
 // ---------------------------------------------------------------------------
 static const uint8_t apple_audio[][31] = {
     {0x1e,0xff,0x4c,0x00,0x07,0x19,0x07,0x02,0x20,0x75,0xaa,0x30,0x01,0x00,0x00,
@@ -95,7 +96,12 @@ static uint8_t s_apple_idx = 0;
 static uint8_t s_fastpair_idx = 0;
 static uint8_t s_mac[6];
 
-// --- diagnostics ----------------------------------------------------------
+// Diagnostic error codes (see header).
+#define ERR_NO_SYNC       (-2)
+#define ERR_PRECHECK      (-1001)
+#define ERR_BRINGUP       (-1002)
+#define ERR_TASK          (-1003)
+
 static volatile int s_last_err = 0;
 
 typedef enum { NB_UNINIT = 0, NB_INITING, NB_READY } nb_state_t;
@@ -144,7 +150,6 @@ static esp_err_t nimble_bring_up(void)
 
     esp_err_t ret = nimble_port_init();
     if (ret != ESP_OK) {
-        s_last_err = (int)ret;
         s_nimble_state = NB_UNINIT;
         return ret;
     }
@@ -162,8 +167,12 @@ static esp_err_t nimble_bring_up(void)
 // ---------------------------------------------------------------------------
 static void random_mac(void)
 {
-    for (int i = 0; i < 6; i++) s_mac[i] = (uint8_t)(esp_random() & 0xFF);
-    s_mac[0] = (s_mac[0] & 0xFC) | 0x02;
+    esp_fill_random(s_mac, sizeof(s_mac));
+    // BLE static random address: the two most significant bits of the
+    // address (in wire order) must be 0b11. NimBLE stores the address
+    // LSB-on-wire-first, so s_mac[5] is the last byte on the air and
+    // therefore carries the MSBs.
+    s_mac[5] = (uint8_t)((s_mac[5] & 0x3F) | 0xC0);
 }
 
 static void next_sourapple(uint8_t *buf, size_t *len)
@@ -190,12 +199,20 @@ static void spam_task(void *arg)
     memset(&s_adv_params, 0, sizeof(s_adv_params));
     s_adv_params.conn_mode = BLE_GAP_CONN_MODE_NON;
     s_adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    // Explicit non-zero intervals. BLE spec minimum for advertising
+    // interval is 0x0020 (20 ms). Zero here would be silently rejected
+    // by the controller.
+    s_adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(100);
+    s_adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(150);
 
     for (int i = 0; i < 150 && !s_synced && s_running; i++) {
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (!s_synced) {
-        if (s_last_err == 0) s_last_err = -2;
+        if (s_last_err == 0) s_last_err = ERR_NO_SYNC;
+        // Host never synced. Reset the state so a future attempt retries
+        // the bring-up instead of skipping it forever.
+        s_nimble_state = NB_UNINIT;
         s_running = false;
         s_task = NULL;
         vTaskDelete(NULL);
@@ -249,9 +266,14 @@ static void spam_task(void *arg)
         ble_gap_adv_stop();
 
         random_mac();
-        ble_hs_id_set_rnd(s_mac);
+        int rc = ble_hs_id_set_rnd(s_mac);
+        if (rc != 0) {
+            s_last_err = rc;
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
 
-        int rc = ble_gap_adv_set_data(payload, (int)len);
+        rc = ble_gap_adv_set_data(payload, (int)len);
         if (rc != 0) {
             s_last_err = rc;
             vTaskDelay(pdMS_TO_TICKS(40));
@@ -283,32 +305,36 @@ esp_err_t ble_spam_start(ble_spam_type_t type)
     if (s_running) return ESP_OK;
     if (type < 0 || type >= BLE_SPAM_COUNT) return ESP_ERR_INVALID_ARG;
 
-    // On first bring-up we must free Wi-Fi's DMA blocks before NimBLE
-    // tries to allocate its own. On subsequent starts NimBLE is already
-    // resident, so this is a no-op.
     if (s_nimble_state != NB_READY) {
+        // Tear down Wi-Fi. This is what frees the contiguous DMA heap
+        // NimBLE needs. On the S3 without PSRAM, Wi-Fi and BLE cannot
+        // coexist — this is the one point where we can recover memory.
         esp_err_t wd = wifi_sniffer_deinit();
         if (wd != ESP_OK) {
             s_last_err = (int)wd;
             return wd;
         }
 
-        // Refuse cleanly if the heap cannot supply the contiguous block
-        // that esp_bt_controller_init + NimBLE buffers need. Failing
-        // here leaves the heap intact; failing inside nimble_port_init()
-        // shatters it into 1 KB fragments.
-        size_t largest = heap_caps_get_largest_free_block(
-            MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        size_t largest    = heap_caps_get_largest_free_block(
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        size_t total_free = heap_caps_get_free_size(
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+
+        ESP_LOGI(TAG, "BLE precheck: largest=%u total=%u threshold=%u",
+                 (unsigned)largest, (unsigned)total_free,
+                 (unsigned)BLE_MIN_CONTIGUOUS_BYTES);
+
         if (largest < BLE_MIN_CONTIGUOUS_BYTES) {
-            ESP_LOGE(TAG, "BLE refused: largest block %u < %u",
-                     (unsigned)largest, (unsigned)BLE_MIN_CONTIGUOUS_BYTES);
-            s_last_err = ESP_ERR_NO_MEM;   // 257
+            // Usually means Wi-Fi was used earlier in this boot and
+            // esp_wifi_deinit() did not return enough contiguous memory.
+            // Nothing this code can do — the caller must reboot.
+            s_last_err = ERR_PRECHECK;
             return ESP_ERR_NO_MEM;
         }
 
         esp_err_t ret = nimble_bring_up();
         if (ret != ESP_OK) {
-            s_last_err = (int)ret;
+            s_last_err = ERR_BRINGUP;
             return ret;
         }
     }
@@ -323,7 +349,7 @@ esp_err_t ble_spam_start(ble_spam_type_t type)
     BaseType_t br = xTaskCreate(spam_task, "ble_spam", 4096, NULL, 5, &s_task);
     if (br != pdPASS) {
         s_running = false;
-        s_last_err = ESP_ERR_NO_MEM;
+        s_last_err = ERR_TASK;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -338,22 +364,17 @@ esp_err_t ble_spam_stop(void)
     }
     ble_gap_adv_stop();
 
-    // NimBLE stays resident for the rest of the boot.
-    //
-    // The previous version called nimble_tear_down() here. Each teardown
-    // plus re-bring-up cycle permanently dropped the largest free block
-    // by ~70 KB and never fully recovered it. Once NimBLE has started
-    // in a boot, tearing it down leaves the heap fragmented enough that
-    // the next start fails at ESP_ERR_NO_MEM (257) with a 0-1 KB largest
-    // block showing in STATS.
-    //
-    // The trade-off is that Wi-Fi cannot be reinitialised after BLE has
-    // started in the same boot. That is a hardware constraint on the
-    // no-PSRAM S3, not something this code can work around.
+    // NimBLE stays resident for the rest of the boot. Tearing it down
+    // permanently fragments the heap (see original comment) and makes
+    // every subsequent start fail with 257. The trade-off is that Wi-Fi
+    // cannot be reinitialised after BLE has started — that constraint
+    // is surfaced to the user via ble_spam_is_resident().
     return ESP_OK;
 }
 
 bool ble_spam_is_running(void) { return s_running; }
+
+bool ble_spam_is_resident(void) { return s_nimble_state == NB_READY; }
 
 int  ble_spam_last_error(void)  { return s_last_err; }
 void ble_spam_clear_error(void) { s_last_err = 0; }

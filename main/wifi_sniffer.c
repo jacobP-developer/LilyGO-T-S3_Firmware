@@ -510,6 +510,18 @@ esp_err_t wifi_sniffer_deinit(void)
     }
     esp_wifi_stop();
     esp_wifi_deinit();
+
+    // Destroy the netif too. If we leave it registered against a driver
+    // that has just been deinitialised, it holds onto internal lwIP /
+    // netif buffers that esp_wifi_deinit() did not reclaim, and the
+    // next call to wifi_sniffer_init() (or to BLE bring-up, which wants
+    // a contiguous DMA block) sees a much smaller free heap than it
+    // should. This was the silent contributor to BLE ERR 257.
+    if (sta_netif) {
+        esp_netif_destroy_default_wifi(sta_netif);
+        sta_netif = NULL;
+    }
+
     initialized = false;
     return ESP_OK;
 }
@@ -551,6 +563,15 @@ void wifi_sniffer_stop(void)
     esp_wifi_set_promiscuous(false);
     esp_wifi_stop();
     sniffing = false;
+}
+
+void wifi_sniffer_set_channel(uint8_t channel)
+{
+    if (channel < 1 || channel > 13) return;
+    current_channel = channel;
+    if (sniffing) {
+        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+    }
 }
 
 void wifi_sniffer_get_stats(int *ap_count, int *client_count)
