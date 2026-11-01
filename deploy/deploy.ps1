@@ -206,8 +206,9 @@ if ($failures.Count -gt 0) {
 Write-Host "[+] Deploy complete." -ForegroundColor Green
 Write-Host ""
 Write-Host "    On the phone:" -ForegroundColor DarkGray
-Write-Host "      nav                                    (start the UI)" -ForegroundColor DarkGray
-Write-Host "      python3 /sdcard/python/c2_android.py   (start the C2)" -ForegroundColor DarkGray
+Write-Host "       tunnel" -ForegroundColor DarkGray
+Write-Host "      New Session -->" -ForegroundColor DarkGray
+Write-Host "       c2" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "    If the C2 has never run on this device, install flask first:" -ForegroundColor DarkGray
 Write-Host "      pkg install python" -ForegroundColor DarkGray

