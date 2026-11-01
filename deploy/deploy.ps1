@@ -91,6 +91,9 @@ if ($deviceLines -match 'unauthorized') {
 if ($deviceLines -match 'offline') {
     Fail "Device offline. Reconnect the USB cable and re-run."
 }
+if ($deviceLines.Count -gt 1) {
+    Fail "Multiple ADB devices connected ($($deviceLines.Count)). Disconnect all but one, or specify a single device."
+}
 $deviceId = ($deviceLines[0] -split '\s+')[0]
 
 # 3. resolve sources

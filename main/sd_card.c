@@ -17,7 +17,12 @@ esp_err_t sd_card_init(void) {
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 5,
-        .allocation_unit_size = 64 * 1024,
+        /* FATFS sizes its work buffer from this (x2, 32 KB floor), so a
+         * 64 KB value asked for a ~128 KB contiguous internal allocation on
+         * a no-PSRAM S3 that already holds the LVGL draw buffer, the Wi-Fi
+         * heaps and TinyUSB -> mount failed and handshake dumps reported
+         * "SD FAIL". One small cluster is plenty for handshake PCAPs. */
+        .allocation_unit_size = 4 * 1024,
     };
 
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();

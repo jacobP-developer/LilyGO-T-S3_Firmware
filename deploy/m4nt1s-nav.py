@@ -483,7 +483,7 @@ def input_windows():
     import msvcrt
     while running.is_set():
         if not msvcrt.kbhit():
-            time.sleep(0.05)
+            time.sleep(0.01)
             continue
         ch = msvcrt.getch()
         if ch == b'\x03':

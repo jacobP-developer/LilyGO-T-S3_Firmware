@@ -20,7 +20,7 @@ static const char *TAG = "ble_spam";
 // the NimBLE buffer counts in menuconfig you can lower this; if you
 // tighten them raise it. A precheck failure here is what produces the
 // user-visible "BLE ERR 257" after Wi-Fi has run in the same boot.
-#define BLE_MIN_CONTIGUOUS_BYTES  (32 * 1024)
+#define BLE_MIN_CONTIGUOUS_BYTES  (24 * 1024)
 
 // ---------------------------------------------------------------------------
 // Payloads

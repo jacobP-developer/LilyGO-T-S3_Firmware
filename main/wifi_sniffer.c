@@ -468,22 +468,22 @@ esp_err_t wifi_sniffer_init(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t e = esp_wifi_init(&cfg);
-    if (e != ESP_OK) return e;
+    if (e != ESP_OK) { if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
 
     e = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (e != ESP_OK) { esp_wifi_deinit(); return e; }
+    if (e != ESP_OK) { esp_wifi_deinit(); if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
 
     e = esp_wifi_set_mode(WIFI_MODE_NULL);
-    if (e != ESP_OK) { esp_wifi_deinit(); return e; }
+    if (e != ESP_OK) { esp_wifi_deinit(); if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
 
     wifi_promiscuous_filter_t filter = {
         .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT
     };
     e = esp_wifi_set_promiscuous_filter(&filter);
-    if (e != ESP_OK) { esp_wifi_deinit(); return e; }
+    if (e != ESP_OK) { esp_wifi_deinit(); if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
 
     e = esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_cb);
-    if (e != ESP_OK) { esp_wifi_deinit(); return e; }
+    if (e != ESP_OK) { esp_wifi_deinit(); if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
 
     if (hop_timer == NULL) {
         esp_timer_create_args_t timer_args = {
@@ -492,7 +492,7 @@ esp_err_t wifi_sniffer_init(void)
             .name     = "wifi_hop"
         };
         e = esp_timer_create(&timer_args, &hop_timer);
-        if (e != ESP_OK) { esp_wifi_deinit(); return e; }
+        if (e != ESP_OK) { esp_wifi_deinit(); if (sta_netif) { esp_netif_destroy_default_wifi(sta_netif); sta_netif = NULL; } return e; }
     }
 
     initialized = true;

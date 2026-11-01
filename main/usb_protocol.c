@@ -9,6 +9,7 @@
 #include "class/hid/hid_device.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/ringbuf.h"
 #include <string.h>
@@ -18,6 +19,10 @@ static const char *TAG = "usb_protocol";
 
 #define SYNC_BYTE 0xAA
 #define USB_TX_TIMEOUT_MS 50
+/* Consecutive zero-byte writes tolerated before a frame is declared dead
+ * (host gone / not polling). 20 * 1 ms keeps a stalled write bounded while
+ * still riding out a normal FIFO drain. */
+#define USB_TX_MAX_STALLS 20
 
 static SemaphoreHandle_t s_tx_mutex = NULL;
 static RingbufHandle_t s_rx_ring = NULL;
@@ -76,8 +81,12 @@ static void cdc_rx_callback(int itf, cdcacm_event_t *event)
     uint8_t buf[64];
     size_t rx_size = 0;
     esp_err_t ret = tinyusb_cdcacm_read(itf, buf, sizeof(buf), &rx_size);
-    if (ret == ESP_OK && rx_size > 0) {
-        xRingbufferSend(s_rx_ring, buf, rx_size, 0);
+    if (ret != ESP_OK || rx_size == 0) return;
+    if (xRingbufferSend(s_rx_ring, buf, rx_size, 0) != pdTRUE) {
+        /* Ring full: these bytes are lost and the host-side parser has to
+         * resync on the next 0xAA. Old code ignored the return value, so
+         * this was an invisible failure. */
+        ESP_LOGW(TAG, "RX ring full, dropped %u byte(s)", (unsigned)rx_size);
     }
 }
 
@@ -85,28 +94,53 @@ int usb_protocol_read(uint8_t *buf, size_t len, TickType_t timeout)
 {
     size_t out_len = 0;
     uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(s_rx_ring, &out_len,
-                                                       timeout, len);
+                                                      timeout, len);
     if (!data) return 0;
     memcpy(buf, data, out_len);
     vRingbufferReturnItem(s_rx_ring, data);
     return (int)out_len;
 }
 
+/* tinyusb_cdcacm_write_queue() returns the number of bytes it actually put
+ * into the CDC FIFO, which is short whenever the host is slow or not
+ * polling. The previous version returned `len` unconditionally, so
+ * write_all() believed the whole frame had gone out: frames were truncated
+ * mid-payload and the host dropped the remainder. Always propagate the
+ * real count. */
 int usb_protocol_write(const uint8_t *buf, size_t len, TickType_t timeout)
 {
-    (void)timeout;
-    tinyusb_cdcacm_write_queue(0, buf, len);
-    tinyusb_cdcacm_write_flush(0, 0);
-    return (int)len;
+    if (!buf || len == 0) return 0;
+
+    size_t queued = tinyusb_cdcacm_write_queue(0, buf, len);
+
+    /* Push the FIFO towards the host. A timeout here (nothing to send, or
+     * the host is not draining) is not fatal as long as something was
+     * queued; a later call flushes it. */
+    esp_err_t flush_err = tinyusb_cdcacm_write_flush(0, timeout);
+    if (flush_err != ESP_OK && queued == 0) {
+        return -1;
+    }
+    return (int)queued;
 }
 
 static esp_err_t write_all(const uint8_t *data, size_t len)
 {
     size_t off = 0;
+    int stalls = 0;
+
     while (off < len) {
         int n = usb_protocol_write(data + off, len - off,
                                    pdMS_TO_TICKS(USB_TX_TIMEOUT_MS));
-        if (n <= 0) return ESP_FAIL;
+        if (n < 0) return ESP_FAIL;
+        if (n == 0) {
+            if (++stalls > USB_TX_MAX_STALLS) return ESP_ERR_TIMEOUT;
+            /* One full tick (10 ms at CONFIG_FREERTOS_HZ=100) so the TinyUSB
+             * task actually runs and drains the FIFO - pdMS_TO_TICKS(1) would
+             * be a no-op yield and the retry loop would just spin. */
+            vTaskDelay(1);
+            continue;
+        }
+        stalls = 0;
         off += (size_t)n;
     }
     return ESP_OK;

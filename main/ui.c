@@ -59,6 +59,7 @@ static int main_page = 0, beacon_page = 0;
 static lv_obj_t *lbl_left_arrow, *lbl_page_name, *lbl_right_arrow;
 static lv_obj_t *lbl_art, *lbl_status;
 static lv_obj_t *lbl_list_prev, *lbl_list_curr, *lbl_list_next;
+static lv_obj_t *hdr_row, *body_box;   // flex containers: header strip / body area
 static bool initialized = false;
 
 static volatile bool s_rotation_pending = false;
@@ -121,8 +122,13 @@ static void apply_rotation_async(void *arg) {
             ? (lv_display_rotation_t)(((int)s_boot_rotation + 3) % 4) : s_boot_rotation;
         lv_display_set_rotation(disp, target);
     }
-    lv_obj_clean(lv_scr_act());
+    // Clear the flag BEFORE the labels are freed so ui_set_status() cannot
+    // touch a dangling pointer if another task gets scheduled in between.
     initialized = false;
+    lbl_art = lbl_left_arrow = lbl_page_name = lbl_right_arrow = NULL;
+    lbl_list_prev = lbl_list_curr = lbl_list_next = lbl_status = NULL;
+    hdr_row = body_box = NULL;
+    lv_obj_clean(lv_scr_act());
     ui_init();
     s_rotation_pending = false;
 }
@@ -137,7 +143,9 @@ void ui_set_status(const char *text) {
     char *buf = status_buf();
     strncpy(buf, text, STATUS_LEN - 1);
     buf[STATUS_LEN - 1] = '\0';
-    if (lbl_status && !list_screen()) lv_label_set_text(lbl_status, buf);
+    // `initialized` matters: apply_rotation_async() frees every label and then
+    // rebuilds, so lbl_status is briefly dangling.
+    if (initialized && lbl_status && !list_screen()) lv_label_set_text(lbl_status, buf);
 }
 
 // DEAUTH list ----------------------------------------------------------------
@@ -207,6 +215,88 @@ void ui_set_stats_list(const char **names_in, const char **values_in, int count)
 int ui_stats_count(void)  { return stats_count; }
 int ui_stats_cursor(void) { return stats_cursor; }
 
+// ---------------------------------------------------------------------------
+// Layout
+//
+// The panel is 80x160 native and the same UI has to work in both orientations
+// (80x160 portrait, 160x80 landscape). Absolute lv_obj_align() positioning is
+// what produced the overlap: the 5-line ASCII art block is ~85 px tall at
+// montserrat_14, which is more than a landscape screen leaves after the header
+// and status rows, and centered labels with no width limit drew straight over
+// their neighbours. Everything is now a flex column sized from the real
+// display metrics, with fonts and line spacing picked so every block fits the
+// space that actually exists.
+// ---------------------------------------------------------------------------
+#define UI_ART_LINES 5
+
+static const lv_font_t *F_BIG   = &lv_font_montserrat_14;
+static const lv_font_t *F_SMALL = &lv_font_montserrat_10;
+
+static int line_h(const lv_font_t *f) { return (int)lv_font_get_line_height(f); }
+
+// Bare container: no style, no padding, no scrolling, flows its children.
+static lv_obj_t *ui_make_box(lv_obj_t *parent, lv_flex_flow_t flow)
+{
+    lv_obj_t *o = lv_obj_create(parent);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_width(o, LV_PCT(100));
+    lv_obj_set_flex_flow(o, flow);
+    lv_obj_set_style_pad_all(o, 0, 0);
+    lv_obj_set_style_pad_row(o, 0, 0);
+    lv_obj_set_style_pad_column(o, 0, 0);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    return o;
+}
+
+// Sizes every block from the current display geometry. Called from ui_init()
+// and at the end of ui_draw_menu(), so a rotation rebuild and a live text
+// change both end up with a consistent, non-overlapping layout.
+static void ui_apply_metrics(void)
+{
+    if (!initialized || !hdr_row || !body_box) return;
+
+    lv_display_t *disp = lv_display_get_default();
+    int w = disp ? (int)lv_display_get_horizontal_resolution(disp) : 80;
+    int h = disp ? (int)lv_display_get_vertical_resolution(disp) : 160;
+
+    // Narrow (portrait) screens need the small font for the title: "WIFI
+    // FLOOD" at montserrat_14 is wider than the gap between the arrows.
+    const lv_font_t *title_f = (w < 120) ? F_SMALL : F_BIG;
+    int hdr_h    = line_h(title_f) + 2;
+    int status_h = line_h(F_SMALL) + 2;
+
+    lv_obj_set_style_text_font(lbl_page_name,   title_f, 0);
+    lv_obj_set_style_text_font(lbl_left_arrow,  title_f, 0);
+    lv_obj_set_style_text_font(lbl_right_arrow, title_f, 0);
+    lv_obj_set_height(hdr_row, hdr_h);
+    lv_obj_set_height(lbl_status, status_h);
+
+    int body_h = h - hdr_h - status_h;
+    if (body_h < UI_ART_LINES) body_h = UI_ART_LINES;
+
+    // ASCII art: biggest font that fits, then pull the line spacing in so
+    // UI_ART_LINES lines can never exceed the body box.
+    const lv_font_t *art_f = F_BIG;
+    if (UI_ART_LINES * line_h(art_f) > body_h) art_f = F_SMALL;
+    int ls = 0;
+    if (UI_ART_LINES * line_h(art_f) > body_h) {
+        ls = (body_h / UI_ART_LINES) - line_h(art_f);
+        if (ls > 0) ls = 0;
+    }
+    lv_obj_set_style_text_font(lbl_art, art_f, 0);
+    lv_obj_set_style_text_line_space(lbl_art, ls, 0);
+
+    // Three single-line rows (prev / current / next) share the same box.
+    const lv_font_t *list_f = (3 * line_h(F_BIG) <= body_h) ? F_BIG : F_SMALL;
+    int row_h = line_h(list_f);
+    if (3 * row_h > body_h) row_h = body_h / 3;
+    lv_obj_t *rows[3] = { lbl_list_prev, lbl_list_curr, lbl_list_next };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_set_style_text_font(rows[i], list_f, 0);
+        lv_obj_set_height(rows[i], row_h);
+    }
+}
+
 // init -----------------------------------------------------------------------
 void ui_init(void) {
     if (initialized) return;
@@ -214,69 +304,94 @@ void ui_init(void) {
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
+    // Root is a flex column: header / body / status. Nothing is positioned
+    // with lv_obj_align() any more, so the rows cannot overlap in either
+    // orientation.
+    lv_obj_set_style_pad_all(scr, 0, 0);
+    lv_obj_set_style_pad_row(scr, 0, 0);
+    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(scr, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
     lv_color_t g_bright = lv_color_make(0, 255, 0);
     lv_color_t g_mid    = lv_color_make(0, 200, 0);
     lv_color_t g_dim    = lv_color_make(0, 120, 0);
 
-    lbl_left_arrow = lv_label_create(scr);
+    hdr_row = ui_make_box(scr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(hdr_row, 2, 0);   // breathing room next to the arrows
+    lv_obj_set_flex_align(hdr_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    body_box = ui_make_box(scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_grow(body_box, 1);
+    lv_obj_set_flex_align(body_box, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lbl_left_arrow = lv_label_create(hdr_row);
     lv_label_set_text(lbl_left_arrow, "<");
     lv_obj_set_style_text_font(lbl_left_arrow, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_left_arrow, g_mid, 0);
-    lv_obj_align(lbl_left_arrow, LV_ALIGN_TOP_LEFT, 2, 0);
 
-    lbl_page_name = lv_label_create(scr);
+    lbl_page_name = lv_label_create(hdr_row);
     lv_obj_set_style_text_font(lbl_page_name, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_page_name, g_bright, 0);
-    lv_obj_align(lbl_page_name, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_text_align(lbl_page_name, LV_TEXT_ALIGN_CENTER, 0);
+    // Ellipsise instead of running under the arrows.
+    lv_label_set_long_mode(lbl_page_name, LV_LABEL_LONG_DOT);
+    lv_obj_set_flex_grow(lbl_page_name, 1);
 
-    lbl_right_arrow = lv_label_create(scr);
+    lbl_right_arrow = lv_label_create(hdr_row);
     lv_label_set_text(lbl_right_arrow, ">");
     lv_obj_set_style_text_font(lbl_right_arrow, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_right_arrow, g_mid, 0);
-    lv_obj_align(lbl_right_arrow, LV_ALIGN_TOP_RIGHT, -2, 0);
 
-    lbl_art = lv_label_create(scr);
+    lbl_art = lv_label_create(body_box);
     lv_obj_set_style_text_font(lbl_art, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_art, g_bright, 0);
     lv_obj_set_style_text_align(lbl_art, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_line_space(lbl_art, 0, 0);
-    lv_obj_align(lbl_art, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_width(lbl_art, LV_PCT(100));
+    // CLIP, not the default WRAP: the art carries its own newlines, and
+    // wrapping a 10-character ASCII line in two on an 80 px wide screen is
+    // exactly what pushed it into the header and the status row.
+    lv_label_set_long_mode(lbl_art, LV_LABEL_LONG_CLIP);
 
-    lbl_list_prev = lv_label_create(scr);
+    lbl_list_prev = lv_label_create(body_box);
     lv_obj_set_style_text_font(lbl_list_prev, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_list_prev, g_mid, 0);
     lv_obj_set_style_text_align(lbl_list_prev, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl_list_prev, LV_PCT(100));
-    lv_obj_align(lbl_list_prev, LV_ALIGN_CENTER, 0, -14);
+    lv_label_set_long_mode(lbl_list_prev, LV_LABEL_LONG_DOT);
     lv_obj_add_flag(lbl_list_prev, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_list_curr = lv_label_create(scr);
+    lbl_list_curr = lv_label_create(body_box);
     lv_obj_set_style_text_font(lbl_list_curr, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_list_curr, lv_color_black(), 0);
     lv_obj_set_style_bg_color(lbl_list_curr, g_bright, 0);
     lv_obj_set_style_bg_opa(lbl_list_curr, LV_OPA_COVER, 0);
     lv_obj_set_style_text_align(lbl_list_curr, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl_list_curr, LV_PCT(100));
-    lv_obj_align(lbl_list_curr, LV_ALIGN_CENTER, 0, 0);
+    lv_label_set_long_mode(lbl_list_curr, LV_LABEL_LONG_DOT);
     lv_obj_add_flag(lbl_list_curr, LV_OBJ_FLAG_HIDDEN);
 
-    lbl_list_next = lv_label_create(scr);
+    lbl_list_next = lv_label_create(body_box);
     lv_obj_set_style_text_font(lbl_list_next, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl_list_next, g_mid, 0);
     lv_obj_set_style_text_align(lbl_list_next, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl_list_next, LV_PCT(100));
-    lv_obj_align(lbl_list_next, LV_ALIGN_CENTER, 0, 14);
+    lv_label_set_long_mode(lbl_list_next, LV_LABEL_LONG_DOT);
     lv_obj_add_flag(lbl_list_next, LV_OBJ_FLAG_HIDDEN);
 
     lbl_status = lv_label_create(scr);
-    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_10, 0);
     lv_obj_set_style_text_color(lbl_status, g_dim, 0);
     lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(lbl_status, LV_PCT(100));
     lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_DOT);
-    lv_obj_align(lbl_status, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     initialized = true;
+    ui_apply_metrics();
     ui_draw_menu();
 }
 
@@ -333,11 +448,9 @@ void ui_draw_menu(void) {
         lv_label_set_text(lbl_status,    status_buf());
     }
 
-    lv_obj_align(lbl_left_arrow,  LV_ALIGN_TOP_LEFT,   2,  0);
-    lv_obj_align(lbl_page_name,   LV_ALIGN_TOP_MID,    0,  0);
-    lv_obj_align(lbl_right_arrow, LV_ALIGN_TOP_RIGHT, -2,  0);
-    lv_obj_align(lbl_art,         LV_ALIGN_CENTER,     0,  0);
-    lv_obj_align(lbl_status,      LV_ALIGN_BOTTOM_MID, 0, -2);
+    // Flex owns the placement now; this only re-picks fonts and row heights
+    // for the current orientation.
+    ui_apply_metrics();
 }
 
 // navigation -----------------------------------------------------------------

